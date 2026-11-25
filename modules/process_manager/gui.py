@@ -3,6 +3,7 @@ Process Manager GUI Module for Mini OS Simulator.
 """
 
 import tkinter as tk
+import math
 from tkinter import ttk, messagebox
 from typing import List, Optional
 import matplotlib
@@ -25,35 +26,40 @@ class ProcessManagerWindow:
         self.parent = parent_window
         self.content_frame = content_frame
         self.mp_result: Optional[MultiprogrammingResult] = None
-        self.playback_time = 0.0
-        self.playback_running = False
-        self.playback_speed = 1.0
-        self.playback_after_id = None
         
         self._setup_ui()
         self._load_sample_data()
     
     def _setup_ui(self):
-        """Setup the UI components."""
-        main_paned = ttk.PanedWindow(self.content_frame, orient=tk.HORIZONTAL)
-        main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Left - Configuration
-        left = ttk.Frame(main_paned)
-        main_paned.add(left, weight=1)
-        
+        # Equal grid columns avoid the collapsed-sash issue in internal windows.
+        main = ttk.Frame(self.content_frame)
+        main.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        main.columnconfigure(0, weight=1, uniform="panels")
+        main.columnconfigure(1, weight=1, uniform="panels")
+        main.rowconfigure(0, weight=1)
+        holder = ttk.Frame(main)
+        holder.grid(row=0,column=0,sticky="nsew",padx=(0,4))
+        holder.rowconfigure(0,weight=1); holder.columnconfigure(0,weight=1)
+        scroll_canvas = tk.Canvas(holder, highlightthickness=0, width=1, height=1, background="#eeeeee")
+        scroll_canvas.grid(row=0,column=0,sticky="nsew")
+        sy=ttk.Scrollbar(holder,orient="vertical",command=scroll_canvas.yview)
+        sx=ttk.Scrollbar(holder,orient="horizontal",command=scroll_canvas.xview)
+        sy.grid(row=0,column=1,sticky="ns"); sx.grid(row=1,column=0,sticky="ew")
+        scroll_canvas.configure(yscrollcommand=sy.set,xscrollcommand=sx.set)
+        left=ttk.Frame(scroll_canvas)
+        win=scroll_canvas.create_window((0,0),window=left,anchor="nw")
+        def resize(event=None):
+            scroll_canvas.itemconfigure(win,width=max(scroll_canvas.winfo_width(),left.winfo_reqwidth()))
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+        left.bind("<Configure>",resize); scroll_canvas.bind("<Configure>",resize)
         self._create_mp_config(left)
         self._create_mp_controls(left)
         self._create_mp_results(left)
-        
-        # Right - Visualization
-        right = ttk.Frame(main_paned)
-        main_paned.add(right, weight=1)
-        
+        right=ttk.Frame(main)
+        right.grid(row=0,column=1,sticky="nsew")
         self._create_mp_visualization(right)
-    
-    # ==================== MULTIPROGRAMMING CONFIG ====================
-    
+        self.mp_timeslice_var.trace_add("write",lambda *_: self._mp_reset())
+
     def _create_mp_config(self, parent):
         """Create multiprogramming configuration."""
         frame = ttk.LabelFrame(parent, text="Process Configuration", padding=10)
@@ -65,6 +71,7 @@ class ProcessManagerWindow:
         for col in columns:
             self.mp_tree.heading(col, text=col)
             self.mp_tree.column(col, width=70, anchor=tk.CENTER)
+        self.mp_tree.configure(displaycolumns=("PID", "Arrival", "Burst", "I/O Freq"))
         self.mp_tree.pack(fill=tk.BOTH, expand=True)
         
         # Add process form
@@ -79,20 +86,18 @@ class ProcessManagerWindow:
         self.mp_arrival_var = tk.DoubleVar(value=0.0)
         ttk.Entry(form, textvariable=self.mp_arrival_var, width=8).grid(row=0, column=3, padx=2)
         
-        ttk.Label(form, text="Burst:").grid(row=0, column=4, padx=2)
+        ttk.Label(form, text="Burst:").grid(row=1, column=0, padx=2)
         self.mp_burst_var = tk.DoubleVar(value=10.0)
-        ttk.Entry(form, textvariable=self.mp_burst_var, width=8).grid(row=0, column=5, padx=2)
+        ttk.Entry(form, textvariable=self.mp_burst_var, width=8).grid(row=1, column=1, padx=2)
         
-        ttk.Label(form, text="I/O Freq:").grid(row=0, column=6, padx=2)
+        ttk.Label(form, text="I/O Freq:").grid(row=1, column=2, padx=2)
         self.mp_io_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(form, textvariable=self.mp_io_var, width=8).grid(row=0, column=7, padx=2)
+        ttk.Entry(form, textvariable=self.mp_io_var, width=8).grid(row=1, column=3, padx=2)
         
-        ttk.Label(form, text="Priority:").grid(row=0, column=8, padx=2)
         self.mp_priority_var = tk.IntVar(value=0)
-        ttk.Entry(form, textvariable=self.mp_priority_var, width=5).grid(row=0, column=9, padx=2)
         
         btn_frame = ttk.Frame(form)
-        btn_frame.grid(row=0, column=10, padx=5)
+        btn_frame.grid(row=2, column=0, columnspan=4, pady=5, sticky="w")
         ttk.Button(btn_frame, text="Add", command=self._mp_add_process).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Remove", command=self._mp_remove_process).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Clear", command=self._mp_clear_processes).pack(side=tk.LEFT, padx=2)
@@ -135,9 +140,9 @@ class ProcessManagerWindow:
         info_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(
             info_frame,
-            text="Priority: lower number = higher priority",
+            text="I/O Freq: CPU time between I/O requests (0 = none).",
             font=("Segoe UI", 8),
-            foreground=COLORS["text_secondary"]
+            foreground="#444444"
         ).pack(side=tk.LEFT, padx=5)
     
     def _on_algo_change(self, event=None):
@@ -147,34 +152,18 @@ class ProcessManagerWindow:
             self.mp_timeslice_spin.configure(state="normal")
         else:
             self.mp_timeslice_spin.configure(state="disabled")
+        self._mp_reset()
     
     # ==================== MULTIPROGRAMMING CONTROLS ====================
     
     def _create_mp_controls(self, parent):
-        """Create simulation controls."""
         frame = ttk.LabelFrame(parent, text="Simulation Controls", padding=10)
         frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # Playback controls
-        ctrl_frame = ttk.Frame(frame)
-        ctrl_frame.pack(fill=tk.X)
-        
-        ttk.Button(ctrl_frame, text="▶ Run", command=self._mp_run).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctrl_frame, text="⏸ Pause", command=self._mp_pause).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctrl_frame, text="⏹ Stop", command=self._mp_stop).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctrl_frame, text="⏮ Reset", command=self._mp_reset).pack(side=tk.LEFT, padx=2)
-        
-        ttk.Label(ctrl_frame, text="Speed:").pack(side=tk.LEFT, padx=(20, 5))
-        self.mp_speed_var = tk.DoubleVar(value=1.0)
-        ttk.Scale(ctrl_frame, from_=0.1, to=5.0, variable=self.mp_speed_var, 
-                 orient=tk.HORIZONTAL, length=100).pack(side=tk.LEFT, padx=5)
-        
-        # Current time display
-        self.mp_time_label = ttk.Label(ctrl_frame, text="Time: 0.00")
-        self.mp_time_label.pack(side=tk.RIGHT, padx=10)
-    
-    # ==================== MULTIPROGRAMMING RESULTS ====================
-    
+        ttk.Button(frame, text="Run Simulation", command=self._mp_run).pack(side=tk.LEFT,padx=2)
+        ttk.Button(frame, text="Reset Results", command=self._mp_reset).pack(side=tk.LEFT,padx=2)
+        self.mp_time_label = ttk.Label(frame, text="Time: 0.00")
+        self.mp_time_label.pack(side=tk.RIGHT,padx=4)
+
     def _create_mp_results(self, parent):
         """Create results panel."""
         frame = ttk.LabelFrame(parent, text="Results", padding=10)
@@ -188,10 +177,10 @@ class ProcessManagerWindow:
         for i, (label, key) in enumerate([
             ("CPU Utilization", "cpu_util"), ("Throughput", "throughput"),
             ("Avg Turnaround", "avg_turnaround"), ("Avg Waiting", "avg_waiting"),
-            ("Avg Response", "avg_response"), ("Context Switches", "ctx_switches"),
-            ("Max Multiprogramming", "max_mp")
+            ("Avg Response", "avg_response"), ("Dispatch switches", "ctx_switches"),
+            ("Peak resident processes", "max_mp")
         ]):
-            row, col = divmod(i, 3)
+            row, col = divmod(i, 2)
             f = ttk.Frame(metrics_frame)
             f.grid(row=row, column=col, padx=8, pady=3, sticky=tk.W)
             ttk.Label(f, text=f"{label}:", font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
@@ -199,8 +188,14 @@ class ProcessManagerWindow:
             self.mp_metrics[key].pack(side=tk.LEFT, padx=3)
         
         # Schedule log
-        self.mp_log = tk.Text(frame, height=10, bg=COLORS["bg_panel"], fg=COLORS["text_primary"], font=FONTS["mono_small"])
-        self.mp_log.pack(fill=tk.BOTH, expand=True)
+        log_frame=ttk.Frame(frame)
+        log_frame.pack(fill=tk.BOTH,expand=True)
+        self.mp_log = tk.Text(log_frame,height=10,width=35,wrap="word",bg=COLORS["bg_panel"],fg=COLORS["text_primary"],font=FONTS["mono_small"],state="disabled")
+        log_scroll=ttk.Scrollbar(log_frame,orient="vertical",command=self.mp_log.yview)
+        self.mp_log.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT,fill=tk.Y)
+        self.mp_log.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        ttk.Label(frame,text="Waiting = ready-queue time only. I/O duration: random 0.5–3 units. Dispatch switches count idle-to-process and PID changes; no switch overhead.",wraplength=340).pack(anchor="w",pady=3)
     
     # ==================== MULTIPROGRAMMING VISUALIZATION ====================
     
@@ -233,14 +228,15 @@ class ProcessManagerWindow:
             if not pid:
                 messagebox.showerror("Error", "Process ID required")
                 return
-            if arrival < 0 or burst <= 0 or io_freq < 0:
+            if not all(math.isfinite(x) for x in (arrival,burst,io_freq)) or arrival < 0 or burst <= 0 or io_freq < 0:
                 messagebox.showerror("Error", "Invalid values (arrival >= 0, burst > 0, io_freq >= 0)")
                 return
-            if any(self.mp_tree.item(item)['values'][0] == pid for item in self.mp_tree.get_children()):
+            if any(str(self.mp_tree.item(item)['values'][0]) == pid for item in self.mp_tree.get_children()):
                 messagebox.showerror("Error", f"Process {pid} already exists")
                 return
             
             self.mp_tree.insert("", tk.END, values=(pid, arrival, burst, io_freq, priority))
+            self._mp_reset()
             self.mp_pid_var.set("")
             self.mp_arrival_var.set(0.0)
             self.mp_burst_var.set(10.0)
@@ -256,11 +252,13 @@ class ProcessManagerWindow:
         if not selection:
             return
         self.mp_tree.delete(selection[0])
+        self._mp_reset()
     
     def _mp_clear_processes(self):
         """Clear all processes."""
         for item in self.mp_tree.get_children():
             self.mp_tree.delete(item)
+        self._mp_reset()
     
     def _mp_on_select(self, event):
         """Populate form from selected process."""
@@ -275,53 +273,33 @@ class ProcessManagerWindow:
         self.mp_priority_var.set(int(values[4]))
     
     def _mp_run(self):
-        """Run multiprogramming simulation."""
-        processes = []
-        for item in self.mp_tree.get_children():
-            vals = self.mp_tree.item(item)['values']
-            processes.append(SimulatedProcess(
-                pid=str(vals[0]), arrival_time=float(vals[1]),
-                burst_time=float(vals[2]), io_frequency=float(vals[3]),
-                priority=int(vals[4])
-            ))
-        
-        if not processes:
-            messagebox.showerror("Error", "No processes defined")
-            return
-        
-        algo = SchedulingAlgorithm(self.mp_algo_var.get())
-        time_slice = self.mp_timeslice_var.get()
-        self.mp_result = ProcessManager.simulate_multiprogramming(processes, algo, time_slice)
-        # Show final simulation timestamp (Reset clears to 0.00)
-        self.mp_time_label.config(text=f"Time: {self.mp_result.total_time:.2f}")
-        self._display_mp_results()
-    
-    def _mp_pause(self):
-        """Pause playback."""
-        self.playback_running = False
-        if self.playback_after_id:
-            self.parent.after_cancel(self.playback_after_id)
-    
-    def _mp_stop(self):
-        """Stop simulation."""
-        self._mp_pause()
-        self.playback_time = 0.0
-        # Preserve the final simulation time in the readout;
-        # only Reset clears it to 0.00.
-        if self.mp_result:
-            self.mp_time_label.config(text=f"Time: {self.mp_result.total_time:.2f}")
+        self._mp_reset()
+        try:
+            processes=[]
+            for item in self.mp_tree.get_children():
+                v=self.mp_tree.item(item)["values"]
+                processes.append(SimulatedProcess(str(v[0]),float(v[1]),float(v[2]),float(v[3]),int(v[4])))
+            if not processes: raise ValueError("No processes defined")
+            algo=SchedulingAlgorithm(self.mp_algo_var.get())
+            time_slice=self.mp_timeslice_var.get() if algo==SchedulingAlgorithm.ROUND_ROBIN else 2.0
+            result=ProcessManager.simulate_multiprogramming(processes,algo,time_slice)
+            if any(p.state!=ProcessState.TERMINATED for p in result.processes):
+                raise ValueError("Simulation exceeded its 1000-time-unit limit; reduce workload.")
+            self.mp_result=result
+            self.mp_time_label.configure(text=f"Time: {result.total_time:.2f}")
             self._display_mp_results()
-    
+        except (ValueError,tk.TclError,RuntimeError,ArithmeticError) as e:
+            messagebox.showerror("Error",str(e))
+
     def _mp_reset(self):
-        """Reset simulation."""
-        self._mp_stop()
-        self.mp_result = None
-        for key in self.mp_metrics:
-            self.mp_metrics[key].config(text="--")
-        self.mp_log.delete(1.0, tk.END)
-        self.mp_ax.clear()
-        self.mp_canvas.draw()
-    
+        self.mp_result=None
+        self.mp_time_label.configure(text="Time: 0.00")
+        for metric in self.mp_metrics.values(): metric.configure(text="--")
+        self.mp_log.configure(state="normal")
+        self.mp_log.delete("1.0",tk.END)
+        self.mp_log.configure(state="disabled")
+        self._draw_mp_gantt()
+
     def _display_mp_results(self):
         """Display multiprogramming results."""
         if not self.mp_result:
@@ -336,10 +314,12 @@ class ProcessManagerWindow:
         self.mp_metrics["ctx_switches"].config(text=str(r.context_switches))
         self.mp_metrics["max_mp"].config(text=str(r.degree_of_multiprogramming))
         
+        self.mp_log.configure(state="normal")
         self.mp_log.delete(1.0, tk.END)
         for event in r.schedule:
             self.mp_log.insert(tk.END, f"[{event.time:6.2f}] {event.process_id:>4} | {event.event_type:<10} | {event.details}\n")
         
+        self.mp_log.configure(state="disabled")
         self._draw_mp_gantt()
     
     def _draw_mp_gantt(self):
@@ -360,32 +340,15 @@ class ProcessManagerWindow:
             self.mp_canvas.draw()
             return
         
-        # Build execution intervals from schedule events
-        # Merge consecutive same-process intervals (e.g., preempt + immediate re-dispatch)
-        intervals = []  # List of (pid, start, end)
-        current_proc = None
-        start_time = 0
-        
-        for event in events:
-            if event.event_type == "start" or event.event_type.startswith("start"):
-                if current_proc is not None:
-                    intervals.append((current_proc, start_time, event.time))
-                current_proc = event.process_id
-                start_time = event.time
-            elif event.event_type in ("preempt", "io", "complete"):
-                if current_proc is not None:
-                    intervals.append((current_proc, start_time, event.time))
-                current_proc = None
-        
-        # Merge consecutive intervals of the same process
-        merged = []
-        for pid, start, end in intervals:
-            if merged and merged[-1][0] == pid and merged[-1][2] == start:
-                # Extend the previous interval
-                merged[-1] = (pid, merged[-1][1], end)
-            else:
-                merged.append((pid, start, end))
-        
+        # State history is authoritative, including SRTF preemptions.
+        merged=[]
+        for proc in r.processes:
+            for (start,state,_),(end,_,_) in zip(proc.state_history,proc.state_history[1:]):
+                if state==ProcessState.RUNNING and end>start:
+                    if merged and merged[-1][0]==proc.pid and merged[-1][2]==start:
+                        merged[-1]=(proc.pid,merged[-1][1],end)
+                    else: merged.append((proc.pid,start,end))
+
         # Group intervals by process for color assignment
         procs = sorted(set(pid for pid, _, _ in merged))
         colors = ['#6c8cff', '#f87171', '#4ade80', '#fbbf24', '#a78bfa', '#60a5fa']
@@ -414,8 +377,8 @@ class ProcessManagerWindow:
         self.mp_ax.set_yticklabels(y_labels, color='white')
         # Set X-axis upper limit to the max interval end time + small padding
         max_end = max((e for _, _, e in merged), default=0)
-        self.mp_ax.set_xlim(0, max_end + 5)
-        self.mp_ax.set_xlabel('Time', color='white')
+        self.mp_ax.set_xlim(0, max(r.total_time * 1.05, 1))
+        self.mp_ax.set_xlabel('Time units (blank = not running)', color='white')
         self.mp_ax.set_title(f'CPU Timeline - {r.algorithm.replace("_", " ").title()}', color='white')
         
         self.mp_fig.tight_layout()

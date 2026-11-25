@@ -28,7 +28,7 @@ class TestProcessManager(unittest.TestCase):
             self.assertEqual(p.state, ProcessState.TERMINATED)
             self.assertGreater(p.completion_time, 0)
             self.assertEqual(p.turnaround_time, p.completion_time - p.arrival_time)
-            self.assertEqual(p.waiting_time, p.turnaround_time - p.burst_time)
+            self.assertAlmostEqual(p.waiting_time, p.turnaround_time - p.burst_time - sum(b[0] - a[0] for a, b in zip(p.state_history, p.state_history[1:]) if a[1].value == 'waiting'), places=7)
         
         # Should have context switches
         self.assertGreater(result.context_switches, 0)

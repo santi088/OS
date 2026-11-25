@@ -1,614 +1,395 @@
-"""
-Deadlock Manager GUI Module for Mini OS Simulator.
-"""
-
+"""Deadlock Manager UI. Banker's Algorithm remains in algorithms.py."""
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import List, Optional
-import matplotlib
-matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
 from gui.theme import COLORS, FONTS
-from modules.deadlock.algorithms import (
-    BankersAlgorithm, BankerState, SafetyResult, RequestResult, generate_sample_state
-)
+from modules.deadlock.algorithms import BankersAlgorithm, generate_sample_state
 
 
 class DeadlockWindow:
-    """Deadlock Manager simulation window."""
-    
     def __init__(self, parent_window, content_frame):
         self.parent = parent_window
         self.content_frame = content_frame
-        self.state: Optional[BankerState] = None
-        self.last_safety_result: Optional[SafetyResult] = None
-        
+        self.state = None
+        self.last_safety_result = None
+        self._building = False
         self._setup_ui()
         self._load_sample_state()
-    
+
+    def _label(self, parent, text='', **kwargs):
+        opts = dict(font=FONTS['body'], anchor='w')
+        opts.update(kwargs)
+        return ttk.Label(parent, text=text, **opts)
+
+    def _panel(self, parent, title, subtitle=None, **pack):
+        frame = ttk.LabelFrame(parent, text=title, padding=10)
+        frame.pack(**pack)
+        if subtitle:
+            self._label(frame, subtitle, font=FONTS['small'], justify='left').pack(fill='x', pady=(0, 5))
+        return frame
+
+    def _button(self, parent, text, command, primary=False):
+        return ttk.Button(parent, text=text, command=command)
+
+    def _entry(self, parent, var, width=5):
+        return ttk.Entry(parent, textvariable=var, width=width, justify='center')
+
     def _setup_ui(self):
-        """Setup the UI components."""
-        main_paned = ttk.PanedWindow(self.content_frame, orient=tk.HORIZONTAL)
-        main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Left panel - Configuration
-        left_frame = ttk.Frame(main_paned)
-        main_paned.add(left_frame, weight=1)
-        
-        self._create_config_panel(left_frame)
-        self._create_matrices_panel(left_frame)
-        self._create_request_panel(left_frame)
-        
-        # Right panel - Results and explanation
-        right_frame = ttk.Frame(main_paned)
-        main_paned.add(right_frame, weight=1)
-        
-        self._create_results_panel(right_frame)
-    
-    def _create_config_panel(self, parent):
-        """Create configuration panel."""
-        config_frame = ttk.LabelFrame(parent, text="System Configuration", padding=10)
-        config_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # Number of processes and resources
-        ttk.Label(config_frame, text="Processes:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        self.num_processes_var = tk.IntVar(value=5)
-        ttk.Spinbox(config_frame, from_=1, to=10, textvariable=self.num_processes_var, width=5,
-                    command=self._on_dimension_change).grid(row=0, column=1, padx=5, pady=5)
-        
-        ttk.Label(config_frame, text="Resources:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        self.num_resources_var = tk.IntVar(value=3)
-        ttk.Spinbox(config_frame, from_=1, to=10, textvariable=self.num_resources_var, width=5,
-                    command=self._on_dimension_change).grid(row=0, column=3, padx=5, pady=5)
-        
-        ttk.Button(config_frame, text="Apply Dimensions", command=self._apply_dimensions).grid(
-            row=0, column=4, padx=10, pady=5)
-        
-        ttk.Button(config_frame, text="Load Sample", command=self._load_sample_state).grid(
-            row=0, column=5, padx=5, pady=5)
-        
-        # Available resources
-        avail_frame = ttk.LabelFrame(config_frame, text="Available Resources", padding=5)
-        avail_frame.grid(row=1, column=0, columnspan=6, sticky=tk.EW, pady=10)
-        
-        self.available_entries = []
-        self.available_labels = []
+        panes = ttk.PanedWindow(self.content_frame, orient=tk.HORIZONTAL)
+        panes.pack(fill='both', expand=True, padx=5, pady=5)
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=1)
+        self._create_config(left)
+        self._create_request(left)
+        self._create_matrices(left)
+        self._create_results(right)
+        # Equal initial widths; allow the user to move the divider afterward.
+        def set_sash(event):
+            if event.width >= 600:
+                panes.sashpos(0, event.width // 2)
+                panes.unbind('<Configure>', sash_binding)
+        sash_binding = panes.bind('<Configure>', set_sash, add='+')
 
-    def _create_matrices_panel(self, parent):
-        """Create matrices display/edit panel."""
-        self.matrices_frame = ttk.LabelFrame(parent, text="Resource Matrices", padding=8)
-        self.matrices_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        
-        self.alloc_entries = []
-        self.max_entries = []
-        self.need_labels = []
-        
-        self._create_matrix_grids()
-    
-    def _create_matrix_grids(self):
-        """Create matrix input grids - process-oriented compact layout."""
-        # Clear existing matrices_frame and rebuild
-        for widget in self.matrices_frame.winfo_children():
-            widget.destroy()
+    def _create_config(self, parent):
+        frame = self._panel(parent, 'System Configuration', fill='x', pady=(0, 8))
+        row = ttk.Frame(frame)
+        row.pack(fill='x', pady=(0, 4))
+        self.num_processes_var = tk.StringVar(value='5')
+        self.num_resources_var = tk.StringVar(value='3')
+        for name, var in [('Processes:', self.num_processes_var), ('Resources:', self.num_resources_var)]:
+            self._label(row, name).pack(side='left', padx=(0, 4))
+            ttk.Spinbox(row, from_=1, to=10, width=4, textvariable=var).pack(side='left', padx=(0, 8))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill='x', pady=(0, 6))
+        self._button(buttons, 'Apply Dimensions', self._apply_dimensions).pack(side='left', padx=(0, 5))
+        self._button(buttons, 'Load Sample', self._load_sample_state).pack(side='left')
+        avail = ttk.LabelFrame(frame, text='Available Resources', padding=5)
+        avail.pack(fill='x')
+        self.available_frame = ttk.Frame(avail)
+        self.available_frame.pack(fill='x')
 
-        self.matrix_container = ttk.Frame(self.matrices_frame)
-        self.matrix_container.pack(fill=tk.BOTH, expand=True)
+    def _create_request(self, parent):
+        frame = self._panel(parent, 'Resource Request', side='bottom', fill='x', pady=(8, 0))
+        row = ttk.Frame(frame)
+        row.pack(fill='x', pady=(0, 4))
+        self._label(row, 'Process:').pack(side='left', padx=(0, 5))
+        self.request_process_var = tk.StringVar(value='P0')
+        self.request_process_spin = ttk.Combobox(row, textvariable=self.request_process_var, state='readonly', width=5)
+        self.request_process_spin.pack(side='left', padx=(0, 10))
+        self._button(row, 'Submit Request', self._submit_request).pack(side='left')
+        self.request_frame = ttk.Frame(frame)
+        self.request_frame.pack(fill='x')
 
-        self.alloc_entries = []
-        self.max_entries = []
-        self.need_labels = []
+    def _create_matrices(self, parent):
+        frame = self._panel(parent, 'Resource Matrices', 'Need = Maximum - Allocation (calculated automatically)', fill='both', expand=True)
+        body = ttk.Frame(frame)
+        body.pack(fill='both', expand=True)
+        body.grid_rowconfigure(0, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+        bg = ttk.Style(self.content_frame).lookup('TFrame', 'background') or self.content_frame.winfo_toplevel().cget('background')
+        self.matrix_canvas = tk.Canvas(body, bg=bg, highlightthickness=0, height=170, width=300)
+        self.matrix_canvas.grid(row=0, column=0, sticky='nsew')
+        sy = ttk.Scrollbar(body, orient='vertical', command=self.matrix_canvas.yview)
+        sx = ttk.Scrollbar(body, orient='horizontal', command=self.matrix_canvas.xview)
+        sy.grid(row=0, column=1, sticky='ns')
+        sx.grid(row=1, column=0, sticky='ew')
+        self.matrix_canvas.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        self.matrix_container = ttk.Frame(self.matrix_canvas)
+        self.matrix_window = self.matrix_canvas.create_window((0, 0), window=self.matrix_container, anchor='nw')
+        self.matrix_container.bind('<Configure>', self._matrix_resize)
+        self.matrix_canvas.bind('<Configure>', self._matrix_resize)
+        self._label(frame, 'Allocation and Maximum are editable. Need is read-only.', font=FONTS['small']).pack(fill='x', pady=(4, 0))
 
-        n_proc = self.num_processes_var.get()
-        n_res = self.num_resources_var.get()
+    def _matrix_resize(self, _event=None):
+        width = max(self.matrix_canvas.winfo_width(), self.matrix_container.winfo_reqwidth())
+        self.matrix_canvas.itemconfigure(self.matrix_window, width=width)
+        self.matrix_canvas.configure(scrollregion=self.matrix_canvas.bbox('all'))
 
-        if not self.state:
-            return
+    def _create_results(self, parent):
+        buttons = ttk.Frame(parent)
+        buttons.pack(fill='x', pady=(0, 6))
+        self._button(buttons, 'Check Safety', self._check_safety).pack(side='left', padx=(0, 5))
+        self._button(buttons, 'Clear Log', self._clear_log).pack(side='left')
 
-        total_cols = 1 + 3 * n_res  # Process col + 3 sections x n_res cols
+        # Keep the analysis and chart visible together, just like the original GUI.
+        body = ttk.Frame(parent)
+        body.pack(fill='both', expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=3)
+        body.rowconfigure(1, weight=2)
+        analysis = ttk.LabelFrame(body, text='Safety Analysis', padding=8)
+        analysis.grid(row=0, column=0, sticky='nsew', pady=(0, 6))
+        self.status_label = tk.Label(analysis, anchor='w', justify='left',
+                                     font=FONTS['heading'], bg=COLORS['bg_panel'], padx=8, pady=6)
+        self.status_label.pack(fill='x')
+        self.status_detail = tk.Label(analysis, anchor='w', justify='left',
+                                      font=FONTS['body'], bg=COLORS['bg_panel'],
+                                      fg=COLORS['text_primary'], padx=8, pady=4, wraplength=250)
+        self.status_detail.pack(fill='x')
+        analysis.bind('<Configure>', lambda e: self.status_detail.configure(wraplength=max(100, e.width-36)))
+        log = ttk.Frame(analysis)
+        log.pack(fill='both', expand=True)
+        self.result_text = tk.Text(log, height=7, width=24, wrap='word',
+                                   font=FONTS['mono_small'], bg=COLORS['bg_panel'],
+                                   fg=COLORS['text_primary'], padx=8, pady=6, state='disabled')
+        scroll = ttk.Scrollbar(log, orient='vertical', command=self.result_text.yview)
+        scroll.pack(side='right', fill='y')
+        self.result_text.pack(side='left', fill='both', expand=True)
+        self.result_text.configure(yscrollcommand=scroll.set)
+        self.result_text.tag_config('heading', foreground='#a8baff', spacing1=5)
+        self.result_text.tag_config('safe', foreground='#4ade80')
+        self.result_text.tag_config('unsafe', foreground='#ff7777')
 
-        # Row 0: Section headers - Process | Allocation | Maximum | Need (auto)
-        # Process header (col 0)
-        ttk.Label(
-            self.matrix_container, text="Process",
-            font=FONTS["heading"], width=10, anchor=tk.CENTER
-        ).grid(row=0, column=0, padx=2, pady=(0, 2), sticky=tk.EW)
-
-        # Allocation header spanning resource columns (col 1 to 1+n_res-1)
-        ttk.Label(
-            self.matrix_container, text="Allocation",
-            font=FONTS["heading"], anchor=tk.CENTER
-        ).grid(row=0, column=1, columnspan=n_res, padx=5, pady=(0, 2), sticky=tk.EW)
-
-        # Maximum header spanning resource columns (col 1+n_res to 1+2*n_res-1)
-        ttk.Label(
-            self.matrix_container, text="Maximum",
-            font=FONTS["heading"], anchor=tk.CENTER
-        ).grid(row=0, column=1 + n_res, columnspan=n_res, padx=5, pady=(0, 2), sticky=tk.EW)
-
-        # Need header spanning resource columns (col 1+2*n_res to 1+3*n_res-1)
-        ttk.Label(
-            self.matrix_container, text="Need (auto)",
-            font=FONTS["heading"], anchor=tk.CENTER
-        ).grid(row=0, column=1 + 2 * n_res, columnspan=n_res, padx=5, pady=(0, 2), sticky=tk.EW)
-
-        # Row 1: Resource sub-headers (R0, R1, ...) repeated for each section
-        # Empty label for Process column (col 0)
-        ttk.Label(
-            self.matrix_container, text="",
-            font=FONTS["small"], width=10, anchor=tk.CENTER
-        ).grid(row=1, column=0, padx=2, pady=(0, 2), sticky=tk.EW)
-
-        # Resource headers for each section
-        for section in range(3):
-            for j in range(n_res):
-                col = 1 + section * n_res + j
-                ttk.Label(
-                    self.matrix_container, text=f"R{j}",
-                    font=FONTS["small"], width=6, anchor=tk.CENTER
-                ).grid(row=1, column=col, padx=1, pady=(0, 2), sticky=tk.EW)
-
-        # Process rows
-        for i in range(n_proc):
-            # Process label (col 0)
-            ttk.Label(
-                self.matrix_container, text=f"P{i}",
-                font=FONTS["body"], width=10, anchor=tk.CENTER
-            ).grid(row=i + 2, column=0, padx=2, pady=1, sticky=tk.EW)
-
-            # Allocation row entries (cols 1 to 1+n_res-1)
-            row_alloc = []
-            for j in range(n_res):
-                entry = ttk.Entry(
-                    self.matrix_container, width=6, justify=tk.CENTER
-                )
-                entry.grid(row=i + 2, column=1 + j, padx=1, pady=1)
-                entry.insert(0, str(self.state.allocation[i][j]))
-                entry.bind(
-                    "<FocusOut>",
-                    lambda e, pi=i, pj=j: self._on_matrix_change(pi, pj, "alloc"),
-                )
-                row_alloc.append(entry)
-            self.alloc_entries.append(row_alloc)
-
-            # Maximum row entries (cols 1+n_res to 1+2*n_res-1)
-            row_max = []
-            for j in range(n_res):
-                entry = ttk.Entry(
-                    self.matrix_container, width=6, justify=tk.CENTER
-                )
-                entry.grid(
-                    row=i + 2, column=1 + n_res + j, padx=1, pady=1
-                )
-                entry.insert(0, str(self.state.maximum[i][j]))
-                entry.bind(
-                    "<FocusOut>",
-                    lambda e, pi=i, pj=j: self._on_matrix_change(pi, pj, "max"),
-                )
-                row_max.append(entry)
-            self.max_entries.append(row_max)
-
-            # Need row labels (read-only, auto-calculated)
-            row_need = []
-            for j in range(n_res):
-                need_val = max(0, self.state.maximum[i][j] - self.state.allocation[i][j])
-                self.state.need[i][j] = need_val
-                lbl = ttk.Label(
-                    self.matrix_container,
-                    text=str(need_val),
-                    width=6,
-                    anchor=tk.CENTER,
-                    background=COLORS["bg_card"],
-                    foreground=COLORS["text_secondary"],
-                    relief="solid",
-                    borderwidth=1,
-                )
-                lbl.grid(
-                    row=i + 2, column=1 + 2 * n_res + j, padx=1, pady=1
-                )
-                row_need.append(lbl)
-            self.need_labels.append(row_need)
-
-        # Configure column weights so columns don't stretch unevenly
-        for col in range(total_cols):
-            self.matrix_container.grid_columnconfigure(col, weight=0)
-    
-    def _on_matrix_change(self, process_idx: int, resource_idx: int, field: str):
-        """Handle matrix value change."""
-        try:
-            if field == "alloc":
-                val = int(self.alloc_entries[process_idx][resource_idx].get())
-                if val < 0:
-                    raise ValueError
-                self.state.allocation[process_idx][resource_idx] = val
-            elif field == "max":
-                val = int(self.max_entries[process_idx][resource_idx].get())
-                if val < 0:
-                    raise ValueError
-                self.state.maximum[process_idx][resource_idx] = val
-            
-            # Validate allocation <= maximum
-            if self.state.allocation[process_idx][resource_idx] > self.state.maximum[process_idx][resource_idx]:
-                messagebox.showerror("Error", f"Allocation cannot exceed Maximum for P{process_idx} R{resource_idx}")
-                # Revert
-                if field == "alloc":
-                    self.state.allocation[process_idx][resource_idx] = self.state.maximum[process_idx][resource_idx]
-                    self.alloc_entries[process_idx][resource_idx].delete(0, tk.END)
-                    self.alloc_entries[process_idx][resource_idx].insert(0, str(self.state.allocation[process_idx][resource_idx]))
-                else:
-                    self.state.maximum[process_idx][resource_idx] = self.state.allocation[process_idx][resource_idx]
-                    self.max_entries[process_idx][resource_idx].delete(0, tk.END)
-                    self.max_entries[process_idx][resource_idx].insert(0, str(self.state.maximum[process_idx][resource_idx]))
-            
-            self._update_need_matrix()
-            
-            self._draw_visualization()
-            
-        except ValueError:
-            messagebox.showerror("Error", "Please enter valid non-negative integers")
-            self._refresh_matrix_values()
-    
-    def _update_need_matrix(self):
-        """Update the need matrix display."""
-        if not self.state:
-            return
-        
-        for i in range(self.state.num_processes):
-            for j in range(self.state.num_resources):
-                need_val = max(0, self.state.maximum[i][j] - self.state.allocation[i][j])
-                self.state.need[i][j] = need_val
-                self.need_labels[i][j].config(text=str(need_val))
-    
-    def _refresh_matrix_values(self):
-        """Refresh matrix entry values from state."""
-        if not self.state:
-            return
-        
-        for i in range(self.state.num_processes):
-            for j in range(self.state.num_resources):
-                self.alloc_entries[i][j].delete(0, tk.END)
-                self.alloc_entries[i][j].insert(0, str(self.state.allocation[i][j]))
-                self.max_entries[i][j].delete(0, tk.END)
-                self.max_entries[i][j].insert(0, str(self.state.maximum[i][j]))
-    
-    def _create_request_panel(self, parent):
-        """Create resource request panel."""
-        req_frame = ttk.LabelFrame(parent, text="Resource Request", padding=10)
-        req_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        ttk.Label(req_frame, text="Process:").grid(row=0, column=0, padx=5, pady=5)
-        self.request_process_var = tk.IntVar(value=0)
-        self.request_process_spin = ttk.Spinbox(req_frame, from_=0, to=9, textvariable=self.request_process_var, width=5)
-        self.request_process_spin.grid(row=0, column=1, padx=5, pady=5)
-        
-        ttk.Label(req_frame, text="Request:").grid(row=0, column=2, padx=5, pady=5)
-        self.request_entries = []
-        
-        self.request_frame = ttk.Frame(req_frame)
-        self.request_frame.grid(row=0, column=3, columnspan=5, padx=5, pady=5)
-        
-        ttk.Button(req_frame, text="Submit Request", command=self._submit_request).grid(
-            row=0, column=8, padx=10, pady=5)
-        
-        self._update_request_entries()
-    
-    def _update_request_entries(self):
-        """Update request entry fields based on resource count."""
-        for widget in self.request_frame.winfo_children():
-            widget.destroy()
-        
-        self.request_entries = []
-        n_res = self.num_resources_var.get()
-        
-        for j in range(n_res):
-            ttk.Label(self.request_frame, text=f"R{j}:").pack(side=tk.LEFT, padx=2)
-            entry = ttk.Entry(self.request_frame, width=5, justify=tk.CENTER)
-            entry.pack(side=tk.LEFT, padx=2)
-            entry.insert(0, "0")
-            self.request_entries.append(entry)
-    
-    def _create_results_panel(self, parent):
-        """Create results and explanation panel."""
-        # Safety check button
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Button(btn_frame, text="Check Safety", command=self._check_safety).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Clear Log", command=self._clear_log).pack(side=tk.LEFT, padx=5)
-        
-        # Results display
-        result_frame = ttk.LabelFrame(parent, text="Safety Analysis", padding=10)
-        result_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.result_text = tk.Text(
-            result_frame,
-            bg=COLORS["bg_panel"],
-            fg=COLORS["text_primary"],
-            font=FONTS["mono_small"],
-            wrap=tk.WORD,
-            state=tk.DISABLED
-        )
-        self.result_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.result_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.result_text.configure(yscrollcommand=scrollbar.set)
-        
-        # Visualization
-        viz_frame = ttk.LabelFrame(parent, text="Resource Allocation Visualization", padding=10)
-        viz_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        self.fig = Figure(figsize=(6, 3), dpi=100, facecolor=COLORS['bg_panel'])
+        viz = ttk.LabelFrame(body, text='Resource Allocation Visualization', padding=8)
+        viz.grid(row=1, column=0, sticky='nsew')
+        self.fig = Figure(figsize=(3.2, 2.0), dpi=100, facecolor=COLORS['bg_panel'])
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor(COLORS['bg_panel'])
-        self.ax.tick_params(colors=COLORS['text_secondary'])
-        for spine in self.ax.spines.values():
-            spine.set_color(COLORS['border'])
-        
-        self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        
-        self._draw_visualization()
-    
-    def _on_dimension_change(self):
-        """Handle dimension spinbox change."""
-        # Just update the request entries
-        self._update_request_entries()
-    
-    def _apply_dimensions(self):
-        """Apply new dimensions and create empty state."""
-        n_proc = self.num_processes_var.get()
-        n_res = self.num_resources_var.get()
-        
-        # Create empty state
-        available = [0] * n_res
-        maximum = [[0] * n_res for _ in range(n_proc)]
-        allocation = [[0] * n_res for _ in range(n_proc)]
-        
-        self.state = BankersAlgorithm.create_state(n_proc, n_res, available, maximum, allocation)
-        
-        # Update available entries
-        self._update_available_entries()
-        self._create_matrix_grids()
-        self._update_request_entries()
-        self._draw_visualization()
-    
-    def _update_available_entries(self):
-        """Update available resource entry fields."""
-        # Clear existing
-        for widget in self.content_frame.winfo_children():
-            pass  # We'll recreate in config panel
-        
-        # Find the available frame
-        for child in self.content_frame.winfo_children():
-            if isinstance(child, ttk.PanedWindow):
-                for pane in child.winfo_children():
-                    for widget in pane.winfo_children():
-                        if isinstance(widget, ttk.LabelFrame) and "Configuration" in str(widget.cget("text")):
-                            for c in widget.winfo_children():
-                                if isinstance(c, ttk.LabelFrame) and "Available" in str(c.cget("text")):
-                                    for w in c.winfo_children():
-                                        w.destroy()
-                                    
-                                    n_res = self.num_resources_var.get()
-                                    self.available_entries = []
-                                    self.available_labels = []
-                                    
-                                    for j in range(n_res):
-                                        ttk.Label(c, text=f"R{j}:").grid(row=0, column=j*2, padx=2, pady=5)
-                                        entry = ttk.Entry(c, width=6, justify=tk.CENTER)
-                                        entry.grid(row=0, column=j*2+1, padx=2, pady=5)
-                                        entry.insert(0, "0")
-                                        entry.bind("<FocusOut>", lambda e, idx=j: self._on_available_change(idx))
-                                        self.available_entries.append(entry)
-    
-    def _on_available_change(self, resource_idx: int):
-        """Handle available resource change."""
+        self.canvas = FigureCanvasTkAgg(self.fig, master=viz)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+
+    def _status(self, title, detail, kind='neutral'):
+        fg = {'neutral': COLORS['text_primary'], 'safe': '#4ade80',
+              'unsafe': '#ff7777', 'warning': '#fbbf24'}[kind]
+        self.status_label.configure(text=title, fg=fg)
+        self.status_detail.configure(text=detail)
+
+    def _safety_detail(self, result):
+        if result is None:
+            return ''
+        if result.is_safe:
+            return 'Safe sequence: ' + ' -> '.join(f'P{i}' for i in result.safe_sequence)
+        return 'No complete safe sequence exists. Unsafe does not mean deadlock has occurred.'
+
+    @staticmethod
+    def _vec(values):
+        return '[' + ', '.join(str(v) for v in values) + ']'
+
+    def _write_log(self, lines):
+        self.result_text.configure(state='normal')
+        self.result_text.delete('1.0', 'end')
+        for line in lines:
+            tag = ''
+            if 'UNSAFE' in line or 'DENIED' in line or 'ERROR' in line or 'Error:' in line:
+                tag = 'unsafe'
+            elif 'SAFE state' in line or 'GRANTED' in line:
+                tag = 'safe'
+            elif line.startswith(('===', '---', 'Step ')):
+                tag = 'heading'
+            self.result_text.insert('end', line + '\n', tag)
+        self.result_text.configure(state='disabled')
+        self.result_text.see('1.0')
+
+    def _clear_log(self):
+        self.last_safety_result = None
+        self._write_log([])
+        self._status('Ready', 'Click Check Safety to analyze the current allocation.')
+
+    def _build_fields(self):
+        self._building = True
         try:
-            val = int(self.available_entries[resource_idx].get())
-            if val < 0:
-                raise ValueError
-            self.state.available[resource_idx] = val
-            self._draw_visualization()
-        except ValueError:
-            messagebox.showerror("Error", "Please enter valid non-negative integers")
-            self.available_entries[resource_idx].delete(0, tk.END)
-            self.available_entries[resource_idx].insert(0, str(self.state.available[resource_idx]))
-    
-    def _load_sample_state(self):
-        """Load the classic textbook sample state."""
-        self.state = generate_sample_state()
-        self.num_processes_var.set(self.state.num_processes)
-        self.num_resources_var.set(self.state.num_resources)
-        
-        self._update_available_entries()
-        self._create_matrix_grids()
-        self._update_request_entries()
-        
-        # Fill available entries
-        for j, val in enumerate(self.state.available):
-            if j < len(self.available_entries):
-                self.available_entries[j].delete(0, tk.END)
-                self.available_entries[j].insert(0, str(val))
-        
+            n, r = self.state.num_processes, self.state.num_resources
+            for frame in (self.available_frame, self.request_frame, self.matrix_container):
+                for w in frame.winfo_children():
+                    w.destroy()
+            self.available_vars, self.request_vars = [], []
+            self.alloc_vars, self.max_vars, self.need_labels = [], [], []
+            for j in range(r):
+                for frame, variables, initial in [(self.available_frame, self.available_vars, self.state.available[j]), (self.request_frame, self.request_vars, 0)]:
+                    group = ttk.Frame(frame)
+                    group.grid(row=j//5, column=j%5, padx=(0, 8), pady=2, sticky='w')
+                    self._label(group, f'R{j}', foreground=ttk.Style(self.content_frame).lookup('TLabel', 'foreground') or 'black', font=FONTS['small']).pack(anchor='w')
+                    v = tk.StringVar(value=str(initial))
+                    self._entry(group, v, 4).pack()
+                    variables.append(v)
+                    if frame is self.available_frame:
+                        v.trace_add('write', self._inputs_changed)
+            self.request_process_spin.configure(values=[f'P{i}' for i in range(n)])
+            self.request_process_var.set('P0')
+            for section, title in enumerate(['Allocation', 'Maximum', 'Need (auto)']):
+                self._label(self.matrix_container, title, anchor='center', font=FONTS['heading'], padding=(0, 4)).grid(row=0, column=1+section*r, columnspan=r, sticky='ew', padx=2)
+                for j in range(r):
+                    self._label(self.matrix_container, f'R{j}', foreground=ttk.Style(self.content_frame).lookup('TLabel', 'foreground') or 'black', anchor='center').grid(row=1, column=1+section*r+j, sticky='ew', padx=2)
+            self._label(self.matrix_container, 'Process', anchor='center', font=FONTS['heading'], padding=(0, 4)).grid(row=0, column=0, sticky='ew', padx=2)
+            for i in range(n):
+                self._label(self.matrix_container, f'P{i}', anchor='center', font=FONTS['heading']).grid(row=i+2, column=0, padx=7, pady=4)
+                av, mv, nv = [], [], []
+                for j in range(r):
+                    for section, variables, value in [(0, av, self.state.allocation[i][j]), (1, mv, self.state.maximum[i][j])]:
+                        var = tk.StringVar(value=str(value))
+                        self._entry(self.matrix_container, var, 4).grid(row=i+2, column=1+section*r+j, padx=2, pady=3, sticky='ew')
+                        variables.append(var)
+                        var.trace_add('write', self._inputs_changed)
+                    label = self._label(self.matrix_container, str(self.state.need[i][j]), background=COLORS['bg_card'], foreground=COLORS['text_primary'], anchor='center', padding=(0, 3))
+                    label.grid(row=i+2, column=1+2*r+j, padx=2, pady=3, sticky='ew')
+                    nv.append(label)
+                self.alloc_vars.append(av)
+                self.max_vars.append(mv)
+                self.need_labels.append(nv)
+            for col in range(31):
+                self.matrix_container.grid_columnconfigure(col, weight=1 if 0 < col < 1+3*r else 0)
+            self.matrix_canvas.xview_moveto(0)
+            self.matrix_canvas.yview_moveto(0)
+        finally:
+            self._building = False
+        self._clear_log()
         self._draw_visualization()
-    
-    def _check_safety(self):
-        """Run the safety algorithm."""
-        if not self.state:
-            messagebox.showerror("Error", "No state configured")
+
+    def _inputs_changed(self, *_):
+        if self._building:
             return
-        
-        # Validate
-        errors = BankersAlgorithm.validate_state(self.state)
+        for i, row in enumerate(self.need_labels):
+            for j, label in enumerate(row):
+                try:
+                    a, m = int(self.alloc_vars[i][j].get()), int(self.max_vars[i][j].get())
+                    valid = 0 <= a <= m
+                    label.configure(text=str(m-a) if valid else 'Invalid', foreground=COLORS['text_primary'] if valid else '#ff7777')
+                except ValueError:
+                    label.configure(text='--', foreground=COLORS['text_primary'])
+        self.last_safety_result = None
+        self._write_log([])
+        self._status('Inputs changed', 'Run Check Safety again. Results from the previous configuration have been cleared.', 'warning')
+        self._draw_visualization()
+
+    def _load_sample_state(self):
+        self.state = generate_sample_state()
+        self.num_processes_var.set(str(self.state.num_processes))
+        self.num_resources_var.set(str(self.state.num_resources))
+        self._build_fields()
+
+    def _apply_dimensions(self):
+        try:
+            n, r = int(self.num_processes_var.get()), int(self.num_resources_var.get())
+            if not (1 <= n <= 10 and 1 <= r <= 10):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror('Invalid dimensions', 'Enter 1 to 10 processes and 1 to 10 resource types.', parent=self.parent)
+            return
+        self.state = BankersAlgorithm.create_state(n, r, [0]*r, [[0]*r for _ in range(n)], [[0]*r for _ in range(n)])
+        self._build_fields()
+
+    def _read_inputs(self):
+        n, r = self.state.num_processes, self.state.num_resources
+        def parse(v):
+            x = int(v.get())
+            if x < 0:
+                raise ValueError
+            return x
+        available = [parse(v) for v in self.available_vars]
+        alloc = [[parse(v) for v in row] for row in self.alloc_vars]
+        maximum = [[parse(v) for v in row] for row in self.max_vars]
+        return BankersAlgorithm.create_state(n, r, available, maximum, alloc)
+
+    def _commit_inputs(self):
+        try:
+            if (int(self.num_processes_var.get()), int(self.num_resources_var.get())) != (self.state.num_processes, self.state.num_resources):
+                messagebox.showerror('Dimensions changed', 'Click Apply Dimensions before analyzing the new configuration.', parent=self.parent)
+                return False
+            state = self._read_inputs()
+        except ValueError:
+            messagebox.showerror('Invalid input', 'Use non-negative whole numbers in all resource fields.', parent=self.parent)
+            return False
+        errors = BankersAlgorithm.validate_state(state)
         if errors:
-            messagebox.showerror("Validation Error", "\n".join(errors))
+            messagebox.showerror('Validation error', '\n'.join(errors), parent=self.parent)
+            return False
+        self.state = state
+        return True
+
+    def _check_safety(self):
+        if not self._commit_inputs():
             return
-        
         result = BankersAlgorithm.safety_algorithm(self.state)
         self.last_safety_result = result
-        
-        self._display_result(result)
-        self._draw_visualization(result)
-    
+        self._status('SAFE STATE' if result.is_safe else 'UNSAFE STATE',
+                     self._safety_detail(result),
+                     'safe' if result.is_safe else 'unsafe')
+        self._write_log(result.explanation)
+        self._draw_visualization()
+
     def _submit_request(self):
-        """Submit a resource request."""
-        if not self.state:
-            messagebox.showerror("Error", "No state configured")
+        if not self._commit_inputs():
             return
-        
-        # Validate current state first
-        errors = BankersAlgorithm.validate_state(self.state)
-        if errors:
-            messagebox.showerror("Validation Error", "\n".join(errors))
+        try:
+            p = int(self.request_process_var.get()[1:])
+            request = [int(v.get()) for v in self.request_vars]
+            if not 0 <= p < self.state.num_processes or any(x < 0 for x in request):
+                raise ValueError
+        except (ValueError, IndexError):
+            messagebox.showerror('Invalid request', 'Choose a valid process and enter non-negative whole numbers.', parent=self.parent)
             return
-        
-        process_id = self.request_process_var.get()
-        if process_id >= self.state.num_processes:
-            messagebox.showerror("Error", f"Invalid process ID. Must be 0-{self.state.num_processes-1}")
-            return
-        
-        request = []
-        for entry in self.request_entries:
-            try:
-                val = int(entry.get())
-                if val < 0:
-                    raise ValueError
-                request.append(val)
-            except ValueError:
-                messagebox.showerror("Error", "Please enter valid non-negative integers for request")
-                return
-        
-        result = BankersAlgorithm.request_algorithm(self.state, process_id, request)
-        self._display_result(result)
-        
-        if result.granted and result.new_state:
-            # Apply the new state
+        before = self.state.copy()
+        result = BankersAlgorithm.request_algorithm(self.state, p, request)
+        safety = result.safety_result
+        if result.granted and result.new_state is not None:
             self.state = result.new_state
-        
-        # Always refresh UI to reflect current state
-        self._refresh_matrix_values()
-        self._update_need_matrix()
-        self._update_available_entries_individual()
-        
-        if result.granted and result.safety_result:
-            self._draw_visualization(result.safety_result)
+            self._building = True
+            try:
+                for j, v in enumerate(self.available_vars):
+                    v.set(str(self.state.available[j]))
+                for i in range(self.state.num_processes):
+                    for j in range(self.state.num_resources):
+                        self.alloc_vars[i][j].set(str(self.state.allocation[i][j]))
+                        self.max_vars[i][j].set(str(self.state.maximum[i][j]))
+                        self.need_labels[i][j].configure(text=str(self.state.need[i][j]), foreground=COLORS['text_primary'])
+            finally:
+                self._building = False
+            self.last_safety_result = safety
+            self._status('REQUEST GRANTED', f'P{p} received {self._vec(request)}. ' + self._safety_detail(safety), 'safe')
         else:
-            self._draw_visualization(self.last_safety_result)
-    
-    def _update_available_entries_individual(self):
-        """Update available resource entry fields individually (fragile-free)."""
-        if not self.state or not self.available_entries:
+            self.state = before
+            self.last_safety_result = None
+            if safety is not None:
+                detail = 'The tentative allocation would be unsafe. Original resources are unchanged.'
+            else:
+                detail = ('Request exceeds the process maximum claim.' if any(x>y for x,y in zip(request,before.need[p]))
+                          else 'Insufficient available resources. The process must wait.' if any(x>y for x,y in zip(request,before.available))
+                          else 'Request not accepted. See the analysis log.')
+                detail += ' Original resources are unchanged.'
+            self._status('REQUEST DENIED', detail, 'unsafe')
+        self._write_log(result.explanation)
+        self._draw_visualization()
+
+    def _draw_visualization(self):
+        if self.state is None or not hasattr(self, 'canvas'):
             return
-        for j, val in enumerate(self.state.available):
-            if j < len(self.available_entries):
-                self.available_entries[j].delete(0, tk.END)
-                self.available_entries[j].insert(0, str(val))
-    
-    def _display_result(self, result):
-        """Display result in text area."""
-        self.result_text.config(state=tk.NORMAL)
-        self.result_text.delete(1.0, tk.END)
-        
-        if isinstance(result, SafetyResult):
-            for line in result.explanation:
-                if "SAFE" in line and "UNSAFE" not in line:
-                    self.result_text.insert(tk.END, line + "\n", "safe")
-                elif "UNSAFE" in line:
-                    self.result_text.insert(tk.END, line + "\n", "unsafe")
-                elif "GRANTED" in line:
-                    self.result_text.insert(tk.END, line + "\n", "granted")
-                elif "DENIED" in line:
-                    self.result_text.insert(tk.END, line + "\n", "denied")
-                else:
-                    self.result_text.insert(tk.END, line + "\n")
-        elif isinstance(result, RequestResult):
-            for line in result.explanation:
-                if "GRANTED" in line:
-                    self.result_text.insert(tk.END, line + "\n", "granted")
-                elif "DENIED" in line:
-                    self.result_text.insert(tk.END, line + "\n", "denied")
-                elif "ERROR" in line or "Error" in line:
-                    self.result_text.insert(tk.END, line + "\n", "error")
-                else:
-                    self.result_text.insert(tk.END, line + "\n")
-        
-        # Configure tags
-        self.result_text.tag_config("safe", foreground="#00ff00")
-        self.result_text.tag_config("unsafe", foreground="#ff4444")
-        self.result_text.tag_config("granted", foreground="#00ff00", font=("Consolas", 9, "bold"))
-        self.result_text.tag_config("denied", foreground="#ff4444", font=("Consolas", 9, "bold"))
-        self.result_text.tag_config("error", foreground="#ffaa00")
-        
-        self.result_text.config(state=tk.DISABLED)
-        self.result_text.see(tk.END)
-    
-    def _clear_log(self):
-        """Clear the result log."""
-        self.result_text.config(state=tk.NORMAL)
-        self.result_text.delete(1.0, tk.END)
-        self.result_text.config(state=tk.DISABLED)
-    
-    def _draw_visualization(self, safety_result: SafetyResult = None):
-        """Draw resource allocation visualization."""
-        self.ax.clear()
-        self.ax.set_facecolor(COLORS['bg_panel'])
-        self.ax.tick_params(colors=COLORS['text_secondary'])
-        for spine in self.ax.spines.values():
+        ax = self.ax
+        ax.clear()
+        ax.set_facecolor(COLORS['bg_panel'])
+        ax.tick_params(colors=COLORS['text_secondary'], labelsize=9)
+        for spine in ax.spines.values():
             spine.set_color(COLORS['border'])
-        
-        if not self.state:
-            self.canvas.draw()
+        try:
+            state = self._read_inputs()
+            if BankersAlgorithm.validate_state(state):
+                raise ValueError
+        except (ValueError, IndexError, AttributeError):
+            ax.text(.5, .5, 'Enter valid resource values.', transform=ax.transAxes,
+                    ha='center', va='center', color=COLORS['text_primary'])
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self.canvas.draw_idle()
             return
-        
-        n_proc = self.state.num_processes
-        n_res = self.state.num_resources
-        
-        # Create stacked bar chart showing allocation per process
-        processes = [f"P{i}" for i in range(n_proc)]
-        bottom = [0] * n_proc
-        colors = ['#6c8cff', '#f87171', '#4ade80', '#fbbf24', '#a78bfa', '#60a5fa', '#34d399', '#fb923c']
-        
-        for j in range(n_res):
-            allocations = [self.state.allocation[i][j] for i in range(n_proc)]
-            self.ax.bar(processes, allocations, bottom=bottom, label=f'R{j}', 
-                       color=colors[j % len(colors)], edgecolor='white', linewidth=0.5)
-            bottom = [bottom[i] + allocations[i] for i in range(n_proc)]
-        
-        # Add maximum as outline
-        for i in range(n_proc):
-            total_max = sum(self.state.maximum[i])
-            if total_max > 0:
-                self.ax.bar(i, total_max, bottom=0, fill=False, edgecolor='yellow', 
-                           linewidth=2, linestyle='--', hatch='//', alpha=0)
-        
-        self.ax.set_ylabel('Resource Instances', color='white')
-        self.ax.set_title('Resource Allocation per Process\n(Dashed outline = Maximum claim)', color='white')
-        self.ax.legend(loc='upper right', facecolor=COLORS['bg_card'], edgecolor=COLORS['border'], labelcolor=COLORS['text_primary'])
-        
-        # Add available as text
-        avail_text = "Available: " + ", ".join(f"R{j}={self.state.available[j]}" for j in range(n_res))
-        self.ax.text(0.02, 0.98, avail_text, transform=self.ax.transAxes, 
-                    color='white', fontsize=9, va='top', ha='left',
-                    bbox=dict(boxstyle='round', facecolor=COLORS['bg_card'], edgecolor=COLORS['border']))
-        
-        # If safety result, highlight safe sequence
-        if safety_result and safety_result.is_safe:
-            seq_text = "Safe Sequence: " + " -> ".join(f"P{i}" for i in safety_result.safe_sequence)
-            self.ax.text(0.98, 0.02, seq_text, transform=self.ax.transAxes,
-                        color='#00ff00', fontsize=9, va='bottom', ha='right',
-                        bbox=dict(boxstyle='round', facecolor=COLORS['bg_card'], edgecolor='#00ff00'))
-        elif safety_result and not safety_result.is_safe:
-            self.ax.text(0.98, 0.02, "UNSAFE STATE", transform=self.ax.transAxes,
-                        color='#ff4444', fontsize=12, fontweight='bold', va='bottom', ha='right',
-                        bbox=dict(boxstyle='round', facecolor=COLORS['bg_card'], edgecolor=COLORS['danger']))
-        
-        self.fig.tight_layout()
-        self.canvas.draw()
+        colors = ['#6c8cff', '#f87171', '#4ade80', '#fbbf24', '#a78bfa',
+                  '#60a5fa', '#34d399', '#fb923c', '#ec72bd', '#9ca3af']
+        ids = list(range(state.num_processes))
+        bottom = [0] * state.num_processes
+        for j in range(state.num_resources):
+            values = [row[j] for row in state.allocation]
+            ax.bar(ids, values, bottom=bottom, label=f'R{j}', color=colors[j],
+                   edgecolor=COLORS['bg_panel'], linewidth=.5)
+            bottom = [x+y for x,y in zip(bottom, values)]
+        ax.set_xticks(ids, [f'P{i}' for i in ids])
+        ax.set_ylim(0, max(1, max(bottom)) * 1.15)
+        ax.set_ylabel('Resource instances', color=COLORS['text_primary'], fontsize=9)
+        ax.set_title('Allocated resources per process', color=COLORS['text_primary'], fontsize=10)
+        ax.legend(loc='upper center', bbox_to_anchor=(.5,-.19), ncol=min(5,state.num_resources),
+                  fontsize=8, frameon=False, labelcolor=COLORS['text_primary'])
+        self.fig.subplots_adjust(left=.17, right=.97, top=.85, bottom=.30 if state.num_resources<=5 else .39)
+        self.canvas.draw_idle()
 
 
 def create_deadlock_module(parent_window, content_frame):
-    """Factory function to create deadlock manager module."""
     return DeadlockWindow(parent_window, content_frame)

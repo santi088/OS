@@ -2,7 +2,7 @@
 Process Manager - Multiprogramming and Multiprocessing Simulation.
 
 Simulates process state transitions, multiprogramming, and multiprocessing.
-Supports multiple CPU scheduling algorithms: FCFS, SJF, SRTF, Priority (NP/P), Round Robin.
+Supports FCFS, SJF, SRTF and Round Robin.
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +10,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 from copy import deepcopy
 import random
+import math
+from decimal import Decimal
 
 
 class ProcessState(Enum):
@@ -51,12 +53,11 @@ class SimulatedProcess:
     remaining_time: float = 0.0
     cpu_time_used: float = 0.0      # Total CPU time consumed
     cpu_since_io: float = 0.0       # CPU time since last I/O (for I/O frequency)
-    slice_elapsed: float = 0.0          # CPU time elapsed in current time slice (RR)
     io_time_remaining: float = 0.0
     start_time: float = -1.0
     completion_time: float = 0.0
     turnaround_time: float = 0.0
-    waiting_time: float = 0.0       # Turnaround - Total Burst (includes I/O wait per classic definition)
+    waiting_time: float = 0.0       # Time spent in the READY state only
     response_time: float = 0.0      # First CPU start - Arrival
     core_id: int = -1               # Which core it's running on (-1 = none)
 
@@ -113,542 +114,171 @@ class MultiprocessingResult:
     avg_response: float
 
 
+def _simulate(processes, algorithm, time_slice, max_time, cores):
+    """Event-driven CPU/I/O model; independent I/O waits, zero switch overhead.
+
+    Equal-time arrivals and I/O completions enter the queue before expired
+    quanta. SJF/SRTF use the next CPU burst (known in this teaching model).
+    Context switches count dispatches from idle or a different PID, not
+    immediate continuation of the same process. Decimal clocks avoid drift.
+    """
+    if not isinstance(algorithm, SchedulingAlgorithm):
+        raise ValueError("Unknown scheduling algorithm")
+    if not isinstance(cores, int) or cores < 1:
+        raise ValueError("Number of cores must be a positive integer")
+    if not math.isfinite(max_time) or max_time <= 0:
+        raise ValueError("Maximum simulation time must be positive and finite")
+    if algorithm == SchedulingAlgorithm.ROUND_ROBIN and (not math.isfinite(time_slice) or time_slice <= 0):
+        raise ValueError("Time slice must be positive and finite")
+    D = lambda x: Decimal(str(x))
+    zero = D(0)
+    limit = D(max_time)
+    quantum = D(time_slice) if algorithm == SchedulingAlgorithm.ROUND_ROBIN else None
+    procs = []
+    seen = set()
+    for p in processes:
+        if not isinstance(p.pid, str) or not p.pid.strip() or p.pid in seen:
+            raise ValueError("Process IDs must be nonempty and unique")
+        seen.add(p.pid)
+        if not all(math.isfinite(v) for v in (p.arrival_time, p.burst_time, p.io_frequency)) or p.arrival_time < 0 or p.burst_time <= 0 or p.io_frequency < 0:
+            raise ValueError("Arrival and I/O frequency must be nonnegative; burst must be positive; all must be finite")
+        procs.append(SimulatedProcess(p.pid, p.arrival_time, p.burst_time, p.io_frequency, p.priority))
+    procs.sort(key=lambda p: (p.arrival_time, p.pid))
+    rem = {p.pid: D(p.burst_time) for p in procs}
+    since = {p.pid: zero for p in procs}
+    freq = {p.pid: D(p.io_frequency) for p in procs}
+    ready_at = {}
+    wait = {p.pid: zero for p in procs}
+    ready, blocked = [], []
+    running = [None]*cores
+    left = [zero]*cores
+    last = [None]*cores
+    busy = [zero]*cores
+    logs = {i: [] for i in range(cores)}
+    t = zero
+    idx = done = switches = peak = 0
+    def log(core, kind, p, details):
+        logs[core].append(CPUScheduleEvent(float(t), kind, p.pid, core, details))
+    def enqueue(p, reason):
+        p.core_id = -1
+        p.record_state_change(float(t), ProcessState.READY, reason.value)
+        ready_at[p.pid] = t
+        ready.append(p)
+    def next_burst(p):
+        return min(rem[p.pid], freq[p.pid]-since[p.pid]) if freq[p.pid] else rem[p.pid]
+    def pick():
+        if algorithm in (SchedulingAlgorithm.SJF, SchedulingAlgorithm.SRTF):
+            return min(ready, key=lambda p: (next_burst(p), p.arrival_time, p.pid))
+        return ready[0]
+    def dispatch(core, p):
+        nonlocal switches
+        ready.remove(p)
+        wait[p.pid] += t-ready_at.pop(p.pid)
+        if last[core] != p.pid:
+            switches += 1
+        last[core] = p.pid
+        running[core] = p
+        left[core] = quantum if quantum is not None else zero
+        if p.start_time < 0:
+            p.start_time = float(t)
+            p.response_time = float(t-D(p.arrival_time))
+        p.core_id = core
+        p.record_state_change(float(t), ProcessState.RUNNING, TransitionReason.SCHEDULED.value)
+        log(core, "start", p, f"Dispatched on CPU {core}")
+    event_count = 0
+    while done < len(procs):
+        event_count += 1
+        if event_count > 50000:
+            raise ValueError("Too many simulation events; increase the time slice or I/O frequency, or reduce workload.")
+        # Admit external events before requeueing expired CPU quanta.
+        while idx < len(procs) and D(procs[idx].arrival_time) <= t:
+            p = procs[idx]; idx += 1
+            enqueue(p, TransitionReason.CREATED)
+            log(0, "ready", p, "Arrived; entered ready queue")
+        blocked.sort(key=lambda entry: entry[0])
+        while blocked and blocked[0][0] <= t:
+            _, p, core = blocked.pop(0)
+            p.io_time_remaining = 0.0
+            enqueue(p, TransitionReason.IO_COMPLETE)
+            log(core, "io_complete", p, "I/O complete; entered ready queue")
+        for core,p in enumerate(running):
+            if p is None: continue
+            pid=p.pid
+            if rem[pid] == zero:
+                p.completion_time=float(t)
+                p.turnaround_time=float(t-D(p.arrival_time))
+                p.waiting_time=float(wait[pid])
+                p.core_id=-1
+                p.record_state_change(float(t), ProcessState.TERMINATED, TransitionReason.TERMINATED.value)
+                log(core,"complete",p,"Process terminated")
+                running[core]=None; done+=1
+            elif freq[pid] and since[pid] == freq[pid]:
+                since[pid]=zero; p.cpu_since_io=0.0
+                duration=D(random.uniform(0.5,3.0))
+                p.io_time_remaining=float(duration); p.core_id=-1
+                p.record_state_change(float(t), ProcessState.WAITING, TransitionReason.IO_REQUEST.value)
+                log(core,"io",p,f"I/O request (duration: {float(duration):.2f})")
+                blocked.append((t+duration,p,core)); running[core]=None
+            elif quantum is not None and left[core] == zero:
+                if ready:
+                    enqueue(p,TransitionReason.TIMEOUT)
+                    log(core,"preempt",p,"Time slice expired")
+                    running[core]=None
+                else:
+                    left[core]=quantum
+        peak=max(peak,sum(p.state not in (ProcessState.NEW,ProcessState.TERMINATED) for p in procs))
+        if done == len(procs) or t >= limit: break
+        if algorithm == SchedulingAlgorithm.SRTF and running[0] is not None and ready:
+            p=running[0]; candidate=pick()
+            if next_burst(candidate)<next_burst(p):
+                enqueue(p,TransitionReason.PREEMPTED)
+                log(0,"preempt",p,f"Preempted by {candidate.pid}")
+                dispatch(0,candidate)
+        for core in range(cores):
+            if running[core] is None and ready: dispatch(core,pick())
+        times=[limit]
+        if idx < len(procs): times.append(D(procs[idx].arrival_time))
+        times.extend(end for end,_,_ in blocked)
+        for core,p in enumerate(running):
+            if p is None: continue
+            times.append(t+next_burst(p))
+            if quantum is not None: times.append(t+left[core])
+        new_t=min(times); delta=new_t-t
+        if delta <= zero: raise RuntimeError("Simulation clock failed to advance")
+        for core,p in enumerate(running):
+            if p is None:
+                last[core]=None  # real idle interval
+                continue
+            pid=p.pid
+            rem[pid]-=delta; since[pid]+=delta; busy[core]+=delta
+            if quantum is not None: left[core]-=delta
+            p.remaining_time=float(rem[pid]); p.cpu_time_used=float(D(p.burst_time)-rem[pid]); p.cpu_since_io=float(since[pid])
+        t=new_t
+    # Report partial runs honestly rather than inventing completion metrics.
+    for p in procs:
+        if p.pid in ready_at: p.waiting_time=float(wait[p.pid]+t-ready_at[p.pid])
+        elif p.state != ProcessState.TERMINATED: p.waiting_time=float(wait[p.pid])
+        if p.state == ProcessState.WAITING:
+            p.io_time_remaining=float(next(end-t for end,q,_ in blocked if q is p))
+    completed=[p for p in procs if p.state == ProcessState.TERMINATED]
+    avg=lambda key: sum(getattr(p,key) for p in completed)/len(completed) if completed else 0.0
+    elapsed=float(t)
+    utils={i: float(busy[i]/t*100) if t else 0.0 for i in range(cores)}
+    throughput=len(completed)/elapsed if elapsed else 0.0
+    return procs,logs,utils,elapsed,throughput,avg("turnaround_time"),avg("waiting_time"),avg("response_time"),switches,peak
+
+
 class ProcessManager:
     """Process management simulation."""
+    @staticmethod
+    def simulate_multiprogramming(processes, algorithm=SchedulingAlgorithm.ROUND_ROBIN, time_slice=2.0, max_time=1000.0):
+        p,logs,u,t,th,ta,w,r,cs,peak=_simulate(processes,algorithm,time_slice,max_time,1)
+        return MultiprogrammingResult(p,logs[0],u[0],th,ta,w,r,cs,t,peak,algorithm.value)
 
     @staticmethod
-    def simulate_multiprogramming(
-        processes: List[SimulatedProcess],
-        algorithm: SchedulingAlgorithm = SchedulingAlgorithm.ROUND_ROBIN,
-        time_slice: float = 2.0,
-        max_time: float = 1000.0
-    ) -> MultiprogrammingResult:
-        """
-        Simulate multiprogramming on a single CPU with configurable scheduling algorithm.
-
-        Context switch convention:
-        A context switch is counted only when the CPU switches from one distinct PID
-        to a different PID (or from idle to a process). If the same process continues
-        running (e.g., same process re-dispatched after time slice with no other
-        ready process), no context switch is counted.
-
-        I/O frequency:
-        I/O is triggered after cumulative CPU burst time since last I/O reaches
-        io_frequency. A value of 0 disables I/O completely.
-
-        Waiting time:
-        Turnaround Time - Total Burst Time (classic OS definition).
-        """
-        # Copy processes
-        procs = [deepcopy(p) for p in processes]
-        procs.sort(key=lambda p: (p.arrival_time, p.pid))
-
-        schedule = []
-        current_time = 0.0
-        ready_queue = []
-        running_proc = None
-        completed = []
-        context_switches = 0
-        last_pid = None  # Track last PID that ran for context switch counting
-        max_in_memory = 0
-
-        # Track I/O completions
-        io_events = []  # (completion_time, process)
-
-        process_idx = 0
-        n_procs = len(procs)
-
-        def select_from_ready(queue: List[SimulatedProcess]) -> Optional[SimulatedProcess]:
-            """Select the next process from the ready queue based on algorithm."""
-            if not queue:
-                return None
-            if algorithm == SchedulingAlgorithm.FCFS:
-                # Already in arrival order
-                return queue[0]
-            elif algorithm == SchedulingAlgorithm.SJF:
-                # Shortest burst time first
-                return min(queue, key=lambda p: (p.burst_time, p.arrival_time, p.pid))
-            elif algorithm == SchedulingAlgorithm.SRTF:
-                # Shortest remaining time first
-                return min(queue, key=lambda p: (p.remaining_time, p.arrival_time, p.pid))
-            elif algorithm == SchedulingAlgorithm.ROUND_ROBIN:
-                # FIFO order
-                return queue[0]
-            return queue[0]
-
-        def remove_from_ready(queue: List[SimulatedProcess], proc: SimulatedProcess):
-            """Remove a specific process from the ready queue."""
-            for i, p in enumerate(queue):
-                if p.pid == proc.pid:
-                    queue.pop(i)
-                    return
-
-        def should_preempt(running: SimulatedProcess, candidate: SimulatedProcess) -> bool:
-            """Check if a candidate process should preempt the running process."""
-            if algorithm == SchedulingAlgorithm.SRTF:
-                return candidate.remaining_time < running.remaining_time
-            return False
-
-        while len(completed) < n_procs and current_time < max_time:
-            # 1. Process arrivals at current_time
-            while process_idx < n_procs and procs[process_idx].arrival_time <= current_time:
-                proc = procs[process_idx]
-                proc.record_state_change(current_time, ProcessState.READY, TransitionReason.CREATED.value)
-                ready_queue.append(proc)
-                process_idx += 1
-
-            # 2. Process I/O completions at current_time
-            io_events.sort(key=lambda x: x[0])
-            while io_events and io_events[0][0] <= current_time:
-                _, proc = io_events.pop(0)
-                proc.record_state_change(current_time, ProcessState.READY, TransitionReason.IO_COMPLETE.value)
-                ready_queue.append(proc)
-
-            # 3. Update max multiprogramming degree
-            in_memory = len([p for p in procs if p.state != ProcessState.NEW and p.state != ProcessState.TERMINATED])
-            max_in_memory = max(max_in_memory, in_memory)
-
-            # 4. Check for preemption (preemptive algorithms only)
-            if running_proc is not None and algorithm == SchedulingAlgorithm.SRTF:
-                candidate = select_from_ready(ready_queue)
-                if candidate is not None and should_preempt(running_proc, candidate):
-                    # Preempt running process
-                    running_proc.record_state_change(current_time, ProcessState.READY, TransitionReason.PREEMPTED.value)
-                    remove_from_ready(ready_queue, candidate)
-                    ready_queue.append(running_proc)
-                    # Re-sort ready queue for preemptive algorithms
-                    if algorithm == SchedulingAlgorithm.SRTF:
-                        ready_queue.sort(key=lambda p: (p.remaining_time, p.arrival_time, p.pid))
-
-                    # Context switch: different PID
-                    if last_pid is not None and last_pid != candidate.pid:
-                        context_switches += 1
-                    last_pid = candidate.pid
-
-                    running_proc = candidate
-                    running_proc.slice_elapsed = 0.0
-                    if running_proc.start_time < 0:
-                        running_proc.start_time = current_time
-                        running_proc.response_time = current_time - running_proc.arrival_time
-
-                    running_proc.record_state_change(current_time, ProcessState.RUNNING, TransitionReason.SCHEDULED.value)
-                    running_proc.core_id = 0
-
-                    schedule.append(CPUScheduleEvent(
-                        time=current_time,
-                        event_type="preempt",
-                        process_id=running_proc.pid,
-                        core_id=0,
-                        details=f"Preempted by {candidate.pid}"
-                    ))
-
-            # 5. If CPU free, schedule next process
-            if running_proc is None and ready_queue:
-                selected = select_from_ready(ready_queue)
-                remove_from_ready(ready_queue, selected)
-                running_proc = selected
-                running_proc.slice_elapsed = 0.0
-
-                # Context switch: from idle or different PID
-                if last_pid is None or last_pid != running_proc.pid:
-                    context_switches += 1
-                last_pid = running_proc.pid
-
-                if running_proc.start_time < 0:
-                    running_proc.start_time = current_time
-                    running_proc.response_time = current_time - running_proc.arrival_time
-
-                running_proc.record_state_change(current_time, ProcessState.RUNNING, TransitionReason.SCHEDULED.value)
-                running_proc.core_id = 0
-
-                schedule.append(CPUScheduleEvent(
-                    time=current_time,
-                    event_type="start",
-                    process_id=running_proc.pid,
-                    core_id=0,
-                    details=f"Started on CPU"
-                ))
-
-            # 6. If still CPU idle, advance to next event
-            if running_proc is None:
-                next_event_time = max_time
-                if process_idx < n_procs:
-                    next_event_time = min(next_event_time, procs[process_idx].arrival_time)
-                if io_events:
-                    next_event_time = min(next_event_time, io_events[0][0])
-
-                if next_event_time == current_time:
-                    break  # Avoid infinite loop
-
-                if next_event_time >= max_time:
-                    break
-
-                current_time = next_event_time
-                continue
-
-            # 7. Determine run duration
-            run_time = running_proc.remaining_time
-            if algorithm == SchedulingAlgorithm.ROUND_ROBIN:
-                remaining_slice = time_slice - running_proc.slice_elapsed
-                if remaining_slice <= 0:
-                    remaining_slice = time_slice
-                run_time = min(run_time, remaining_slice)
-
-            # Cap at next arrival
-            if process_idx < n_procs:
-                time_to_next_arrival = procs[process_idx].arrival_time - current_time
-                if time_to_next_arrival > 0:
-                    run_time = min(run_time, time_to_next_arrival)
-
-            # Cap at next I/O completion event
-            if io_events:
-                time_to_next_io = io_events[0][0] - current_time
-                if time_to_next_io > 0:
-                    run_time = min(run_time, time_to_next_io)
-
-            # Cap at I/O frequency trigger (this process's next I/O request)
-            if running_proc.io_frequency > 0:
-                cpu_before_io = running_proc.io_frequency - running_proc.cpu_since_io
-                if cpu_before_io > 0:
-                    run_time = min(run_time, cpu_before_io)
-
-            # 8. Execute the run
-            if run_time <= 0:
-                current_time += 0.001
-                continue
-
-            current_time += run_time
-            running_proc.remaining_time -= run_time
-            running_proc.cpu_time_used += run_time
-            running_proc.cpu_since_io += run_time
-            if algorithm == SchedulingAlgorithm.ROUND_ROBIN:
-                running_proc.slice_elapsed += run_time
-
-            # 9. Check process completion
-            if running_proc.remaining_time <= 0.001:
-                running_proc.completion_time = current_time
-                running_proc.turnaround_time = current_time - running_proc.arrival_time
-                running_proc.waiting_time = running_proc.turnaround_time - running_proc.burst_time
-
-                running_proc.record_state_change(current_time, ProcessState.TERMINATED, TransitionReason.TERMINATED.value)
-
-                schedule.append(CPUScheduleEvent(
-                    time=current_time,
-                    event_type="complete",
-                    process_id=running_proc.pid,
-                    core_id=0,
-                    details="Process terminated"
-                ))
-
-                completed.append(running_proc)
-                if last_pid is not None and last_pid != running_proc.pid:
-                    context_switches += 1
-                last_pid = None
-                running_proc = None
-                continue
-
-            # 10. Check I/O trigger (only if we ran up to the I/O boundary)
-            if running_proc.io_frequency > 0 and running_proc.cpu_since_io >= running_proc.io_frequency - 0.001:
-                running_proc.cpu_since_io = 0.0
-                io_time = random.uniform(0.5, 3.0)
-                io_completion = current_time + io_time
-
-                running_proc.record_state_change(
-                    current_time, ProcessState.WAITING, TransitionReason.IO_REQUEST.value
-                )
-
-                schedule.append(CPUScheduleEvent(
-                    time=current_time,
-                    event_type="io",
-                    process_id=running_proc.pid,
-                    core_id=0,
-                    details=f"I/O request (duration: {io_time:.1f})"
-                ))
-
-                io_events.append((io_completion, running_proc))
-                if last_pid is not None and last_pid != running_proc.pid:
-                    context_switches += 1
-                last_pid = None
-                running_proc = None
-                continue
-
-            # 11. Check time slice expiration (RR only)
-            if algorithm == SchedulingAlgorithm.ROUND_ROBIN and running_proc.slice_elapsed >= time_slice - 0.001:
-                # If no other processes are waiting, same process continues
-                # without any context switch or redundant preempt/start events
-                if len(ready_queue) == 0:
-                    running_proc.slice_elapsed = 0.0
-                    running_proc.record_state_change(current_time, ProcessState.RUNNING, TransitionReason.SCHEDULED.value)
-                    schedule.append(CPUScheduleEvent(
-                        time=current_time,
-                        event_type="start",
-                        process_id=running_proc.pid,
-                        core_id=0,
-                        details=f"Continued after time slice ({time_slice})"
-                    ))
-                    # running_proc continues, no context switch, no last_pid change
-                else:
-                    # Other processes waiting - preempt current process
-                    running_proc.slice_elapsed = 0.0
-                    running_proc.record_state_change(current_time, ProcessState.READY, TransitionReason.TIMEOUT.value)
-                    ready_queue.append(running_proc)
-
-                    if last_pid is not None and last_pid != running_proc.pid:
-                        context_switches += 1
-
-                    schedule.append(CPUScheduleEvent(
-                        time=current_time,
-                        event_type="preempt",
-                        process_id=running_proc.pid,
-                        core_id=0,
-                        details=f"Time slice expired ({time_slice})"
-                    ))
-
-                    running_proc = None
-
-        # Calculate metrics
-        total_time = current_time
-        execution_time = sum(p.cpu_time_used for p in procs)
-        cpu_util = (execution_time / total_time * 100) if total_time > 0 else 0
-        throughput = len(completed) / total_time if total_time > 0 else 0
-
-        avg_turnaround = sum(p.turnaround_time for p in completed) / len(completed) if completed else 0
-        avg_waiting = sum(p.waiting_time for p in completed) / len(completed) if completed else 0
-        avg_response = sum(p.response_time for p in completed) / len(completed) if completed else 0
-
-        return MultiprogrammingResult(
-            processes=procs,
-            schedule=schedule,
-            cpu_utilization=cpu_util,
-            throughput=throughput,
-            avg_turnaround=avg_turnaround,
-            avg_waiting=avg_waiting,
-            avg_response=avg_response,
-            context_switches=context_switches,
-            total_time=total_time,
-            degree_of_multiprogramming=max_in_memory,
-            algorithm=algorithm.value
-        )
-
-    @staticmethod
-    def simulate_multiprocessing(
-        processes: List[SimulatedProcess],
-        num_cores: int = 2,
-        time_slice: float = 2.0,
-        max_time: float = 1000.0
-    ) -> MultiprocessingResult:
-        """
-        Simulate multiprocessing on multiple CPUs.
-
-        Each core runs independently with shared ready queue.
-        Uses Round Robin scheduling per core.
-        """
-        procs = [deepcopy(p) for p in processes]
-        procs.sort(key=lambda p: (p.arrival_time, p.pid))
-
-        # Per-core state
-        core_running = [None] * num_cores
-        core_schedules = {i: [] for i in range(num_cores)}
-        core_busy_time = [0.0] * num_cores
-
-        ready_queue = []
-        io_events = []  # (completion_time, process)
-        completed = []
-        process_idx = 0
-        n_procs = len(procs)
-        current_time = 0.0
-        context_switches = 0
-        last_pid_per_core = {i: None for i in range(num_cores)}
-
-        # Waiting time tracking
-        waiting_accum = {p.pid: 0.0 for p in procs}
-        last_ready_time = {}
-
-        def add_waiting(pid: str, up_to_time: float):
-            if pid in last_ready_time:
-                waiting_accum[pid] += up_to_time - last_ready_time[pid]
-                del last_ready_time[pid]
-
-        def set_ready(pid: str, at_time: float):
-            last_ready_time[pid] = at_time
-
-        while len(completed) < n_procs and current_time < max_time:
-            # Process arrivals
-            while process_idx < n_procs and procs[process_idx].arrival_time <= current_time:
-                proc = procs[process_idx]
-                proc.record_state_change(current_time, ProcessState.READY, TransitionReason.CREATED.value)
-                ready_queue.append(proc)
-                set_ready(proc.pid, current_time)
-                process_idx += 1
-
-            # I/O completions
-            io_events.sort(key=lambda x: x[0])
-            while io_events and io_events[0][0] <= current_time:
-                _, proc = io_events.pop(0)
-                proc.record_state_change(current_time, ProcessState.READY, TransitionReason.IO_COMPLETE.value)
-                ready_queue.append(proc)
-                set_ready(proc.pid, current_time)
-
-            # Schedule on free cores (Round Robin/FIFO)
-            for core_id in range(num_cores):
-                if core_running[core_id] is None and ready_queue:
-                    proc = ready_queue.pop(0)
-                    if proc.start_time < 0:
-                        proc.start_time = current_time
-                        proc.response_time = current_time - proc.arrival_time
-
-                    proc.record_state_change(current_time, ProcessState.RUNNING, TransitionReason.SCHEDULED.value)
-                    proc.core_id = core_id
-                    core_running[core_id] = proc
-
-                    # Context switch
-                    if last_pid_per_core[core_id] is None or last_pid_per_core[core_id] != proc.pid:
-                        context_switches += 1
-                    last_pid_per_core[core_id] = proc.pid
-
-                    add_waiting(proc.pid, current_time)
-
-                    core_schedules[core_id].append(CPUScheduleEvent(
-                        time=current_time,
-                        event_type="start",
-                        process_id=proc.pid,
-                        core_id=core_id,
-                        details=f"Started on Core {core_id}"
-                    ))
-
-            # Check if all cores idle and no pending events
-            if all(c is None for c in core_running) and not ready_queue:
-                next_event = max_time
-                if process_idx < n_procs:
-                    next_event = min(next_event, procs[process_idx].arrival_time)
-                if io_events:
-                    next_event = min(next_event, io_events[0][0])
-
-                if next_event == current_time or next_event == max_time:
-                    break
-                current_time = next_event
-                continue
-
-            # Find next event time
-            next_times = []
-
-            # Time slice for each running process
-            for core_id, proc in enumerate(core_running):
-                if proc:
-                    run_time = min(time_slice, proc.remaining_time)
-                    next_times.append(current_time + run_time)
-
-            # I/O events
-            for io_time, _ in io_events:
-                next_times.append(io_time)
-
-            # Process arrivals
-            if process_idx < n_procs:
-                next_times.append(procs[process_idx].arrival_time)
-
-            if not next_times:
-                break
-
-            next_time = min(next_times)
-            delta = next_time - current_time
-
-            # Advance running processes
-            for core_id, proc in enumerate(core_running):
-                if proc:
-                    proc.cpu_time_used += delta
-                    proc.remaining_time -= delta
-                    core_busy_time[core_id] += delta
-                    proc.cpu_since_io += delta
-
-                    # Check I/O trigger
-                    if proc.io_frequency > 0 and proc.cpu_since_io >= proc.io_frequency:
-                        proc.cpu_since_io = 0.0
-                        io_time = random.uniform(0.5, 3.0)
-                        io_completion = current_time + io_time
-
-                        proc.record_state_change(current_time, ProcessState.WAITING, TransitionReason.IO_REQUEST.value)
-
-                        core_schedules[core_id].append(CPUScheduleEvent(
-                            time=current_time, event_type="io",
-                            process_id=proc.pid, core_id=core_id,
-                            details=f"I/O request ({io_time:.1f})"
-                        ))
-                        io_events.append((io_completion, proc))
-                        # Context switch
-                        if last_pid_per_core[core_id] is not None and last_pid_per_core[core_id] != proc.pid:
-                            context_switches += 1
-                        last_pid_per_core[core_id] = None
-                        core_running[core_id] = None
-
-            current_time = next_time
-
-            # Handle time slice expiration
-            for core_id in range(num_cores):
-                proc = core_running[core_id]
-                if proc is None:
-                    continue
-                if proc.remaining_time <= 0.001:
-                    # Completed
-                    proc.completion_time = current_time
-                    proc.turnaround_time = current_time - proc.arrival_time
-                    proc.waiting_time = waiting_accum.get(proc.pid, 0.0)
-
-                    proc.record_state_change(current_time, ProcessState.TERMINATED, TransitionReason.TERMINATED.value)
-
-                    core_schedules[core_id].append(CPUScheduleEvent(
-                        time=current_time, event_type="complete",
-                        process_id=proc.pid, core_id=core_id, details="Terminated"
-                    ))
-
-                    completed.append(proc)
-                    # Context switch
-                    if last_pid_per_core[core_id] is not None and last_pid_per_core[core_id] != proc.pid:
-                        context_switches += 1
-                    last_pid_per_core[core_id] = None
-                    core_running[core_id] = None
-                elif abs(proc.cpu_time_used % time_slice) < 0.001 and proc.remaining_time > 0:
-                    # Time slice expired
-                    add_waiting(proc.pid, current_time)
-                    proc.record_state_change(current_time, ProcessState.READY, TransitionReason.TIMEOUT.value)
-                    ready_queue.append(proc)
-
-                    # Context switch: only if different PID
-                    if last_pid_per_core[core_id] is not None and last_pid_per_core[core_id] != proc.pid:
-                        context_switches += 1
-                    last_pid_per_core[core_id] = None
-                    core_running[core_id] = None
-
-                    core_schedules[core_id].append(CPUScheduleEvent(
-                        time=current_time, event_type="preempt",
-                        process_id=proc.pid, core_id=core_id,
-                        details=f"Time slice expired"
-                    ))
-
-        # Calculate metrics
-        total_time = current_time
-        core_utils = {}
-        for i in range(num_cores):
-            core_utils[i] = (core_busy_time[i] / total_time * 100) if total_time > 0 else 0
-
-        overall_busy = sum(core_busy_time)
-        overall_util = (overall_busy / (total_time * num_cores) * 100) if total_time > 0 else 0
-        throughput = len(completed) / total_time if total_time > 0 else 0
-
-        avg_turnaround = sum(p.turnaround_time for p in completed) / len(completed) if completed else 0
-        avg_waiting = sum(p.waiting_time for p in completed) / len(completed) if completed else 0
-        avg_response = sum(p.response_time for p in completed) / len(completed) if completed else 0
-
-        return MultiprocessingResult(
-            processes=procs,
-            core_schedules=core_schedules,
-            core_utilizations=core_utils,
-            total_time=total_time,
-            overall_cpu_utilization=overall_util,
-            throughput=throughput,
-            avg_turnaround=avg_turnaround,
-            avg_waiting=avg_waiting,
-            avg_response=avg_response
-        )
+    def simulate_multiprocessing(processes,num_cores=2,time_slice=2.0,max_time=1000.0):
+        p,logs,u,t,th,ta,w,r,_,_=_simulate(processes,SchedulingAlgorithm.ROUND_ROBIN,time_slice,max_time,num_cores)
+        return MultiprocessingResult(p,logs,u,t,sum(u.values())/num_cores,th,ta,w,r)
 
 
 def generate_sample_processes() -> List[SimulatedProcess]:

@@ -147,8 +147,8 @@ class PagingSimulator:
         if not entry.valid:
             return None, False, f"Page {page_num} not in memory (invalid bit)"
         
-        if entry.frame_number >= config.num_frames:
-            return None, False, f"Frame number {entry.frame_number} exceeds physical frames ({config.num_frames})"
+        if not 0 <= entry.frame_number < config.num_frames:
+            return None, False, f"Frame number {entry.frame_number} outside valid range (0-{config.num_frames-1})"
         
         physical_address = entry.frame_number * config.page_size + offset
         
@@ -449,6 +449,16 @@ class FragmentationSimulator:
         Returns:
             FragmentationResult
         """
+        # Reject invalid inputs before allocating; adjacent supplied blocks remain independent.
+        if any(b.start < 0 or b.size <= 0 for b in memory_blocks):
+            raise ValueError("Memory block start must be non-negative and size positive")
+        ordered = sorted(memory_blocks, key=lambda b: b.start)
+        if any(left.end >= right.start for left, right in zip(ordered, ordered[1:])):
+            raise ValueError("Memory blocks must not overlap")
+        if any(not pid.strip() or size <= 0 for pid, size in process_requests):
+            raise ValueError("Process IDs must be non-empty and sizes positive")
+        if len({pid for pid, _ in process_requests}) != len(process_requests):
+            raise ValueError("Process IDs must be unique")
         # Work with copies
         blocks = [MemoryBlock(b.start, b.size, b.allocated, b.process_id) for b in memory_blocks]
         allocations = []
@@ -543,7 +553,7 @@ class FragmentationSimulator:
         
         # Calculate fragmentation
         internal_frag = 0
-        external_frag = 0
+        largest_free = 0
         allocated_mem = 0
         free_mem = 0
         
@@ -552,7 +562,11 @@ class FragmentationSimulator:
                 allocated_mem += block.size
             else:
                 free_mem += block.size
-                external_frag += block.size
+                largest_free = max(largest_free, block.size)
+
+        # Size-based estimate: free space outside the largest available block.
+        # The simulator treats supplied blocks as separate holes (no coalescing).
+        external_frag = free_mem - largest_free
         
         # Internal fragmentation would be calculated if we tracked exact process sizes
         # For simplicity, we assume no internal fragmentation in this model

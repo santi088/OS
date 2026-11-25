@@ -36,6 +36,11 @@ class DiskConfig:
     def __post_init__(self):
         self.min_cylinder, self.max_cylinder = self.cylinder_range
         
+        # Cylinder addresses are non-negative integers.
+        if any(type(v) is not int for v in (self.min_cylinder, self.max_cylinder, self.initial_head, *self.requests)):
+            raise ValueError("Cylinder addresses must be integers")
+        if self.min_cylinder < 0 or self.min_cylinder >= self.max_cylinder:
+            raise ValueError("Require 0 <= min cylinder < max cylinder")
         # Validate
         if not (self.min_cylinder <= self.initial_head <= self.max_cylinder):
             raise ValueError(f"Initial head {self.initial_head} out of range {self.cylinder_range}")
@@ -59,6 +64,9 @@ class DiskResult:
     avg_seek_distance: float
     execution_path: List[Tuple[int, int, int]]  # (from, to, distance)
     
+    # One event per execution_path entry: request, boundary, wrap, wrap_request.
+    step_kinds: List[str] = field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "algorithm": self.algorithm.value,
@@ -71,6 +79,7 @@ class DiskResult:
             "total_head_movement": self.total_head_movement,
             "avg_seek_distance": self.avg_seek_distance,
             "execution_path": self.execution_path,
+            "step_kinds": self.step_kinds,
         }
 
 
@@ -102,7 +111,8 @@ class DiskScheduler:
             seek_distances=seek_distances,
             total_head_movement=total,
             avg_seek_distance=avg,
-            execution_path=execution_path
+            execution_path=execution_path,
+            step_kinds=["request"] * len(execution_path)
         )
     
     @staticmethod
@@ -135,212 +145,75 @@ class DiskScheduler:
             seek_distances=seek_distances,
             total_head_movement=total,
             avg_seek_distance=avg,
-            execution_path=execution_path
+            execution_path=execution_path,
+            step_kinds=["request"] * len(execution_path)
         )
     
+    @staticmethod
+    def _sweep(config: DiskConfig, algorithm: DiskAlgorithm) -> DiskResult:
+        """Finite request queue; count every cylinder traversed, including wraps.
+
+        SCAN reverses at a boundary; LOOK reverses at a pending request.
+        Circular variants keep their direction and wrap without intermediate service.
+        Stop as soon as the last queued request is served.
+        """
+        current = config.initial_head
+        up = config.initial_direction == "up"
+        circular = algorithm in (DiskAlgorithm.CSCAN, DiskAlgorithm.CLOOK)
+        use_boundary = algorithm in (DiskAlgorithm.SCAN, DiskAlgorithm.CSCAN)
+        remaining = config.requests.copy()
+        service_order, seek_distances, execution_path, step_kinds = [], [], [], []
+
+        def move(destination, kind):
+            nonlocal current
+            distance = abs(destination - current)
+            execution_path.append((current, destination, distance))
+            seek_distances.append(distance)
+            step_kinds.append(kind)
+            if kind in ("request", "wrap_request"):
+                service_order.append(destination)
+                remaining.remove(destination)
+            current = destination
+
+        while remaining:
+            candidates = [r for r in remaining if (r >= current if up else r <= current)]
+            if candidates:
+                move(min(candidates) if up else max(candidates), "request")
+                continue
+            if use_boundary:
+                boundary = config.max_cylinder if up else config.min_cylinder
+                if current != boundary:
+                    move(boundary, "boundary")
+            if circular:
+                if use_boundary:
+                    move(config.min_cylinder if up else config.max_cylinder, "wrap")
+                else:
+                    # C-LOOK services the destination, not requests passed during wrap.
+                    move(min(remaining) if up else max(remaining), "wrap_request")
+            else:
+                up = not up
+
+        total = sum(seek_distances)
+        return DiskResult(algorithm, config, service_order, seek_distances,
+                          total, total / len(service_order) if service_order else 0,
+                          execution_path, step_kinds)
+
     @staticmethod
     def scan(config: DiskConfig) -> DiskResult:
-        """SCAN (Elevator) - goes to end then reverses."""
-        current = config.initial_head
-        direction = config.initial_direction  # "up" or "down"
-        remaining = config.requests.copy()
-        service_order = []
-        seek_distances = []
-        execution_path = []
-        
-        min_cyl, max_cyl = config.cylinder_range
-        
-        while remaining:
-            # Find requests in current direction
-            if direction == "up":
-                candidates = [r for r in remaining if r >= current]
-                if candidates:
-                    next_req = min(candidates)
-                else:
-                    # No requests in current direction, go to end and reverse
-                    if current != max_cyl:
-                        distance = max_cyl - current
-                        execution_path.append((current, max_cyl, distance))
-                        seek_distances.append(distance)
-                        current = max_cyl
-                    direction = "down"
-                    continue
-            else:  # down
-                candidates = [r for r in remaining if r <= current]
-                if candidates:
-                    next_req = max(candidates)
-                else:
-                    if current != min_cyl:
-                        distance = current - min_cyl
-                        execution_path.append((current, min_cyl, distance))
-                        seek_distances.append(distance)
-                        current = min_cyl
-                    direction = "up"
-                    continue
-            
-            distance = abs(next_req - current)
-            execution_path.append((current, next_req, distance))
-            seek_distances.append(distance)
-            service_order.append(next_req)
-            current = next_req
-            remaining.remove(next_req)
-        
-        total = sum(seek_distances)
-        avg = total / len(seek_distances) if seek_distances else 0
-        
-        return DiskResult(
-            algorithm=DiskAlgorithm.SCAN,
-            config=config,
-            service_order=service_order,
-            seek_distances=seek_distances,
-            total_head_movement=total,
-            avg_seek_distance=avg,
-            execution_path=execution_path
-        )
-    
+        return DiskScheduler._sweep(config, DiskAlgorithm.SCAN)
+
     @staticmethod
     def cscan(config: DiskConfig) -> DiskResult:
-        """C-SCAN (Circular SCAN) - goes to end, jumps to start."""
-        current = config.initial_head
-        direction = "up"  # C-SCAN always goes up
-        remaining = config.requests.copy()
-        service_order = []
-        seek_distances = []
-        execution_path = []
-        
-        min_cyl, max_cyl = config.cylinder_range
-        
-        while remaining:
-            candidates = [r for r in remaining if r >= current]
-            
-            if candidates:
-                next_req = min(candidates)
-                distance = abs(next_req - current)
-                execution_path.append((current, next_req, distance))
-                seek_distances.append(distance)
-                service_order.append(next_req)
-                current = next_req
-                remaining.remove(next_req)
-            else:
-                # Go to max, then jump to min
-                if current != max_cyl:
-                    distance = max_cyl - current
-                    execution_path.append((current, max_cyl, distance))
-                    seek_distances.append(distance)
-                    current = max_cyl
-                
-                # Jump from max to min (this is a seek too)
-                if remaining:
-                    distance = max_cyl - min_cyl
-                    execution_path.append((max_cyl, min_cyl, distance))
-                    seek_distances.append(distance)
-                    current = min_cyl
-        
-        total = sum(seek_distances)
-        avg = total / len(seek_distances) if seek_distances else 0
-        
-        return DiskResult(
-            algorithm=DiskAlgorithm.CSCAN,
-            config=config,
-            service_order=service_order,
-            seek_distances=seek_distances,
-            total_head_movement=total,
-            avg_seek_distance=avg,
-            execution_path=execution_path
-        )
-    
+        return DiskScheduler._sweep(config, DiskAlgorithm.CSCAN)
+
     @staticmethod
     def look(config: DiskConfig) -> DiskResult:
-        """LOOK - like SCAN but only goes to last request."""
-        current = config.initial_head
-        direction = config.initial_direction
-        remaining = config.requests.copy()
-        service_order = []
-        seek_distances = []
-        execution_path = []
-        
-        while remaining:
-            if direction == "up":
-                candidates = [r for r in remaining if r >= current]
-                if candidates:
-                    next_req = min(candidates)
-                else:
-                    # Reverse direction
-                    direction = "down"
-                    continue
-            else:
-                candidates = [r for r in remaining if r <= current]
-                if candidates:
-                    next_req = max(candidates)
-                else:
-                    direction = "up"
-                    continue
-            
-            distance = abs(next_req - current)
-            execution_path.append((current, next_req, distance))
-            seek_distances.append(distance)
-            service_order.append(next_req)
-            current = next_req
-            remaining.remove(next_req)
-        
-        total = sum(seek_distances)
-        avg = total / len(seek_distances) if seek_distances else 0
-        
-        return DiskResult(
-            algorithm=DiskAlgorithm.LOOK,
-            config=config,
-            service_order=service_order,
-            seek_distances=seek_distances,
-            total_head_movement=total,
-            avg_seek_distance=avg,
-            execution_path=execution_path
-        )
-    
+        return DiskScheduler._sweep(config, DiskAlgorithm.LOOK)
+
     @staticmethod
     def clook(config: DiskConfig) -> DiskResult:
-        """C-LOOK - like C-SCAN but only to last request."""
-        current = config.initial_head
-        direction = "up"
-        remaining = config.requests.copy()
-        service_order = []
-        seek_distances = []
-        execution_path = []
-        
-        while remaining:
-            candidates = [r for r in remaining if r >= current]
-            
-            if candidates:
-                next_req = min(candidates)
-                distance = abs(next_req - current)
-                execution_path.append((current, next_req, distance))
-                seek_distances.append(distance)
-                service_order.append(next_req)
-                current = next_req
-                remaining.remove(next_req)
-            else:
-                # Jump to lowest request
-                if remaining:
-                    next_req = min(remaining)
-                    distance = abs(next_req - current)
-                    execution_path.append((current, next_req, distance))
-                    seek_distances.append(distance)
-                    service_order.append(next_req)
-                    current = next_req
-                    remaining.remove(next_req)
-        
-        total = sum(seek_distances)
-        avg = total / len(seek_distances) if seek_distances else 0
-        
-        return DiskResult(
-            algorithm=DiskAlgorithm.CLOOK,
-            config=config,
-            service_order=service_order,
-            seek_distances=seek_distances,
-            total_head_movement=total,
-            avg_seek_distance=avg,
-            execution_path=execution_path
-        )
-    
+        return DiskScheduler._sweep(config, DiskAlgorithm.CLOOK)
+
     @staticmethod
     def run_algorithm(algorithm: DiskAlgorithm, config: DiskConfig) -> DiskResult:
         """Run specified disk scheduling algorithm."""
